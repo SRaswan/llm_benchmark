@@ -2932,6 +2932,7 @@ dependencies = [
  "burn",
  "burn-ndarray",
  "burn-tch",
+ "burn-train",
  "burn-wgpu",
  "candle-core 0.8.4",
  "candle-nn",

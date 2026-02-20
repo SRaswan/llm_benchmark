@@ -2,6 +2,7 @@ mod benchmark;
 mod candle_runner;
 mod model;
 mod prompts;
+mod training;
 
 use benchmark::{benchmark_model, compare_results, compare_generation_results, BenchmarkConfig};
 use burn_ndarray::{NdArray, NdArrayDevice};
@@ -176,7 +177,62 @@ fn main() {
              On macOS with Apple Silicon add --features candle,metal for GPU.\n"
         );
     }
-}
+    // ──────────────────────────────────────────────────────────────────────────
+    // Section 3 – Training benchmark with Burn TUI dashboard
+    // ──────────────────────────────────────────────────────────────────────────
+    #[cfg(feature = "train")]
+    {
+        use burn::backend::Autodiff;
+        use training::inner::run_training_benchmark;
+
+        println!("\n{:=<80}", "");
+        println!(" SECTION 3: Training Throughput + Burn TUI Dashboard");
+        println!("{:=<80}\n", "");
+        println!(
+            "Trains the same GPT model with Adam (random data, cross-entropy loss)\n\
+             across NdArray-Autodiff (CPU) and WGPU-Autodiff (GPU).\n\
+             The terminal will switch to the ratatui TUI for each backend –\n\
+             it shows a live loss curve, items/sec, and epoch progress.\n"
+        );
+
+        let train_epochs = 3;
+        let train_batch  = bench_config.batch_size;
+
+        for (model_name, gpt_config) in &model_configs {
+            println!("{:->60}", "");
+            println!(" Model: {}  (training)", model_name.to_uppercase());
+            println!("{:->60}", "");
+
+            // NdArray + Autodiff (CPU)
+            run_training_benchmark::<Autodiff<NdArray>>(
+                gpt_config,
+                NdArrayDevice::Cpu,
+                "NdArray-Autodiff (CPU)",
+                train_epochs,
+                train_batch,
+            );
+
+            // WGPU + Autodiff (GPU)
+            run_training_benchmark::<Autodiff<Wgpu>>(
+                gpt_config,
+                WgpuDevice::default(),
+                "WGPU-Autodiff (GPU)",
+                train_epochs,
+                train_batch,
+            );
+        }
+    }
+
+    #[cfg(not(feature = "train"))]
+    {
+        println!("\n{:=<80}", "");
+        println!(" SECTION 3: Training Benchmark – DISABLED");
+        println!("{:=<80}", "");
+        println!(
+            "\n  Enable with:  cargo run --features train\n\
+             Runs full forward+backward+Adam steps with the Burn TUI dashboard.\n"
+        );
+    }}
 
 fn print_system_info() {
     println!("\n📊 System Information:");

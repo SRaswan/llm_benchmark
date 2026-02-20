@@ -1,151 +1,77 @@
-# LLM Benchmark - Rust
+# llm_benchmark
 
-A high-performance benchmarking suite for comparing LLM inference across different Burn backends and hardware targets.
+Benchmarks LLM inference performance in Rust across two independent sections:
 
-## 🎯 Features
+1. **Burn backend comparison** – identical custom GPT architecture run against NdArray (CPU), WGPU (GPU), and optionally LibTorch (PyTorch). Measures forward-pass throughput (input tokens/sec) with random weights so only the backend/hardware differs.
 
-- **Multiple Backends**: Compare performance across:
-  - **NdArray** (CPU backend)
-  - **WGPU** (GPU backend via WebGPU/Metal/Vulkan)
-  - Optional: **LibTorch** (PyTorch backend)
+2. **Candle pure-Rust generation** – loads a real quantised GGUF model (TinyLlama Q4_K_M by default) via HuggingFace Candle and runs autoregressive generation on a fixed prompt set. Measures TTFT, output tokens/sec, and per-token latency p50/p95.
 
-- **Lightweight GPT Model**: 
-  - Pre-configured tiny and small transformer models
-  - Easy to customize model architecture
-  - Based on GPT-style decoder-only architecture
+---
 
-- **Comprehensive Metrics**:
-  - Average inference time per iteration
-  - Tokens per second throughput
-  - Side-by-side comparison of backends
-
-## 🚀 Quick Start
-
-### Prerequisites
-
-- Rust (latest stable)
-- For GPU support: Vulkan/Metal drivers
-
-### Build and Run
+## Running
 
 ```bash
-# Build the project
-cargo build --release
-
-# Run benchmarks
+# Section 1 only (Burn backends, no download required)
 cargo run --release
+
+# Section 1 + Section 2 (Candle, downloads ~700 MB GGUF on first run)
+cargo run --release --features candle
+
+# macOS Apple Silicon – use Metal GPU for Candle
+cargo run --release --features candle,metal
+
+# Section 1 + Section 3 (training + TUI dashboard)
+cargo run --release --features train
+
+# Section 2 + Section 3 (Candle + training)
+cargo run --release --features candle,train
+
+# All three sections (Candle, Metal, and training)
+cargo run --release --features candle,metal,train
+
+# Include LibTorch/PyTorch backend in section 1 (requires libtorch installed)
+cargo run --release --features tch
 ```
 
-## 📊 Model Configurations
+Model files are cached by `hf-hub` in `~/.cache/huggingface/hub/` after the first download.
 
-### Tiny Model (Fast)
-- Vocab Size: 512
-- Hidden Size: 128
-- Layers: 2
-- Attention Heads: 2
-- Max Sequence: 64
+## Apples-to-apples methodology
 
-### Small Model (Balanced)
-- Vocab Size: 2048
-- Hidden Size: 256
-- Layers: 4
-- Attention Heads: 4
-- Max Sequence: 128
+**Section 1 (Burn)**
+- Same `GptConfig`, same random input shape, same warm-up + iteration count across all backends. Only the Burn backend (and thus the compute kernel) changes.
+- Metric: input tokens processed per second (forward-pass throughput).
 
-## 🔧 Customization
+**Section 2 (Candle)**
+- Same GGUF weights, same tokeniser, same prompts (`src/prompts.rs`), greedy decoding (temperature = 0, no sampling randomness).
+- Model load time is measured separately and excluded from all throughput numbers.
+- Metrics: TTFT (prefill latency), output tokens/sec (decode throughput), per-token latency p50/p95.
 
-### Adding Custom Model Sizes
-
-Edit `src/model.rs` to add new configurations:
-
-```rust
-impl GptConfig {
-    pub fn my_custom_model() -> Self {
-        Self::new()
-            .with_vocab_size(4096)
-            .with_hidden_size(512)
-            .with_num_layers(8)
-            .with_num_heads(8)
-            .with_max_seq_len(256)
-            .with_intermediate_size(2048)
-    }
-}
-```
-
-### Adjusting Benchmark Settings
-
-Modify the benchmark configuration in `src/main.rs`:
-
-```rust
-let bench_config = BenchmarkConfig::new(
-    batch_size: 8,          // Number of sequences
-    sequence_length: 64,    // Tokens per sequence
-    num_iterations: 100     // Benchmark iterations
-);
-```
-
-### Adding LibTorch Backend
-
-Uncomment in `Cargo.toml`:
-```toml
-burn-tch = "0.14"
-```
-
-Then add to main.rs:
-```rust
-use burn::backend::libtorch::{LibTorch, LibTorchDevice};
-
-let device = LibTorchDevice::Cuda(0); // or LibTorchDevice::Cpu
-let model = Gpt::<LibTorch>::new(&config, &device);
-```
-
-## 📁 Project Structure
+## Project structure
 
 ```
-llm-benchmark/
-├── src/
-│   ├── main.rs          # Benchmark runner
-│   ├── model.rs         # GPT transformer implementation
-│   └── benchmark.rs     # Benchmarking utilities
-├── Cargo.toml          # Dependencies
-└── README.md
+src/
+  main.rs           – orchestrates both benchmark sections
+  model.rs          – GPT-style decoder-only model (Burn)
+  benchmark.rs      – BenchmarkStats (forward-pass) + GenerationStats (generation)
+  candle_runner.rs  – Candle GGUF loader and greedy decode loop (feature: candle)
+  prompts.rs        – fixed prompt set used by section 2
+Cargo.toml
 ```
 
-## 🎨 Example Output
+## Burn model configs
 
-```
-🚀 LLM Benchmarking Suite for Rust
+| Config | vocab | hidden | layers | heads | seq |
+|--------|------:|-------:|-------:|------:|----:|
+| tiny   |   512 |    128 |      2 |     2 |  64 |
+| small  |  2048 |    256 |      4 |     4 | 128 |
 
-================================================================================
-Testing TINY model configuration
-================================================================================
+To add a custom size, add a method to `GptConfig` in `src/model.rs` and pass it to `benchmark_model` in `main.rs`.
 
-┌─────────────────────────────────┐
-│  NdArray Backend (CPU)          │
-└─────────────────────────────────┘
+## Benchmark settings
 
-╔═══════════════════════════════════════════════════════════╗
-║          Benchmark Results: NdArray (CPU)                 ║
-╠═══════════════════════════════════════════════════════════╣
-║ Model Size:                                         tiny   ║
-║ Batch Size:                                            4   ║
-║ Sequence Length:                                      32   ║
-║ Iterations:                                           50   ║
-╟───────────────────────────────────────────────────────────╢
-║ Total Time:                                        1.25s   ║
-║ Avg Time/Iter:                                    25.0ms   ║
-║ Throughput:                                  2560.00 tok/s ║
-╚═══════════════════════════════════════════════════════════╝
-```
+Defaults in `BenchmarkConfig` (`src/benchmark.rs`): batch size 4, sequence length 32, 50 iterations. Preset alternatives: `BenchmarkConfig::quick()` (20 iters) and `BenchmarkConfig::thorough()` (100 iters).
 
-## 🤝 Contributing
+## Candle model
 
-Feel free to add more backends, model architectures, or benchmark metrics!
-
-## 📝 License
-
-MIT
-
-## 🔗 Built With
-
-- [Burn](https://github.com/tracel-ai/burn) - Deep learning framework for Rust
+Default: `TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF` · `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf`  
+To switch models, change `CandleModelConfig` in `src/candle_runner.rs` – any GGUF-format LLaMA-architecture model works.

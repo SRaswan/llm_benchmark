@@ -7,6 +7,9 @@ edition = "2021"
 default = []
 # PyTorch via LibTorch C++ bindings
 tch = ["dep:burn-tch"]
+# Training benchmark with Burn's TUI dashboard (LearnerBuilder)
+# Enables autograd on NdArray + WGPU and runs LM training steps.
+train = ["dep:burn-train"]
 # Pure-Rust LLM inference via HuggingFace Candle
 candle = [
     "dep:candle-core",
@@ -21,10 +24,11 @@ metal = ["candle-core?/metal"]
 cuda = ["candle-core?/cuda"]
 
 [dependencies]
-burn = "0.14"
+burn = { version = "0.14", features = ["train"] }
 burn-ndarray = "0.14"
 burn-wgpu = "0.14"
-burn-tch = { version = "0.14", optional = true }
+burn-tch   = { version = "0.14", optional = true }
+burn-train = { version = "0.14", optional = true }
 
 # Pure-Rust LLM runtime (HuggingFace Candle)
 # Supports loading GGUF quantised models (TinyLlama, Phi-3, Llama-3, …)

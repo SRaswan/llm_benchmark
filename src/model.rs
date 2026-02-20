@@ -75,6 +75,8 @@ pub struct Gpt<B: Backend> {
     lm_head: Linear<B>,
     dropout: Dropout,
     max_seq_len: usize,
+    /// Stored for Display / summary only.
+    hidden_size: usize,
 }
 
 impl<B: Backend> Gpt<B> {
@@ -106,6 +108,7 @@ impl<B: Backend> Gpt<B> {
             lm_head,
             dropout,
             max_seq_len: config.max_seq_len,
+            hidden_size: config.hidden_size,
         }
     }
 
