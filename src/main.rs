@@ -1,41 +1,60 @@
 mod benchmark;
+mod candle_runner;
 mod model;
+mod prompts;
 
-use benchmark::{benchmark_model, compare_results, BenchmarkConfig};
+use benchmark::{benchmark_model, compare_results, compare_generation_results, BenchmarkConfig};
 use burn_ndarray::{NdArray, NdArrayDevice};
 use burn_wgpu::{Wgpu, WgpuDevice};
 #[cfg(feature = "tch")]
 use burn_tch::{LibTorch, LibTorchDevice};
 use model::{Gpt, GptConfig};
+use prompts::{BENCHMARK_PROMPTS, WARMUP_PROMPT};
 
 fn main() {
-    println!("🚀 LLM Benchmarking Suite for Rust\n");
-    println!("This benchmark compares LLM inference performance across different Burn backends.\n");
+    println!("LLM Benchmarking Suite for Rust\n");
+    println!(
+        "Two benchmark sections:\n\
+         1. Burn framework comparison (custom GPT, random weights) – measures\n\
+            framework / backend overhead on identical architecture.\n\
+         2. Candle pure-Rust LLM (real GGUF weights) – measures end-to-end\n\
+            autoregressive generation on real prompts with the same metrics.\n"
+    );
+    print_system_info();
 
-    // Configuration
+    // ──────────────────────────────────────────────────────────────────────────
+    // Section 1 – Burn backend comparison (forward-pass throughput)
+    // ──────────────────────────────────────────────────────────────────────────
+    println!("{:=<80}", "");
+    println!(" SECTION 1: Burn Backend Throughput (identical architecture, random weights)");
+    println!("{:=<80}\n", "");
+    println!(
+        "Apples-to-apples: same GptConfig, same random input tensor shape,\n\
+         same iteration count, same warm-up passes. Only backend differs.\n\
+         Metric: input tokens processed per second (forward-pass throughput).\n"
+    );
+
     let bench_config = BenchmarkConfig::default();
-    let mut all_results = Vec::new();
+    let mut burn_results = Vec::new();
 
-    // Model configurations to test
     let model_configs = vec![
         ("tiny", GptConfig::tiny()),
         ("small", GptConfig::small()),
     ];
 
-    for (model_name, gpt_config) in model_configs {
-        println!("\n{:=>80}", "");
-        println!("Testing {} model configuration", model_name.to_uppercase());
-        println!("{:=>80}\n", "");
+    for (model_name, gpt_config) in &model_configs {
+        println!("\n{:->60}", "");
+        println!(" Model: {}  (vocab={}, hidden={}, layers={}, heads={})",
+            model_name.to_uppercase(),
+            gpt_config.vocab_size, gpt_config.hidden_size,
+            gpt_config.num_layers, gpt_config.num_heads);
+        println!("{:->60}\n", "");
 
-        // Benchmark on NdArray backend (CPU)
-        println!("┌─────────────────────────────────┐");
-        println!("│  NdArray Backend (CPU)          │");
-        println!("└─────────────────────────────────┘");
-        
+        // NdArray (CPU – pure Rust ndarray)
+        println!("[ NdArray (CPU) ]");
         let device_ndarray = NdArrayDevice::Cpu;
-        let model_ndarray = Gpt::<NdArray>::new(&gpt_config, &device_ndarray);
-        
-        let result = benchmark_model(
+        let model_ndarray = Gpt::<NdArray>::new(gpt_config, &device_ndarray);
+        let r = benchmark_model(
             &model_ndarray,
             bench_config.batch_size,
             bench_config.sequence_length,
@@ -44,18 +63,14 @@ fn main() {
             "NdArray (CPU)",
             model_name,
         );
-        result.print_summary();
-        all_results.push(result);
+        r.print_summary();
+        burn_results.push(r);
 
-        // Benchmark on WGPU backend (GPU)
-        println!("┌─────────────────────────────────┐");
-        println!("│  WGPU Backend (GPU)             │");
-        println!("└─────────────────────────────────┘");
-        
+        // WGPU (GPU via Metal / Vulkan / DX12)
+        println!("[ WGPU (GPU) ]");
         let device_wgpu = WgpuDevice::default();
-        let model_wgpu = Gpt::<Wgpu>::new(&gpt_config, &device_wgpu);
-        
-        let result = benchmark_model(
+        let model_wgpu = Gpt::<Wgpu>::new(gpt_config, &device_wgpu);
+        let r = benchmark_model(
             &model_wgpu,
             bench_config.batch_size,
             bench_config.sequence_length,
@@ -64,20 +79,16 @@ fn main() {
             "WGPU (GPU)",
             model_name,
         );
-        result.print_summary();
-        all_results.push(result);
+        r.print_summary();
+        burn_results.push(r);
 
-        // Benchmark on LibTorch backend (PyTorch)
+        // LibTorch / PyTorch (optional feature `tch`)
         #[cfg(feature = "tch")]
         {
-            println!("┌─────────────────────────────────┐");
-            println!("│  LibTorch Backend (PyTorch CPU) │");
-            println!("└─────────────────────────────────┘");
-
+            println!("[ LibTorch (PyTorch CPU) ]");
             let device_tch = LibTorchDevice::Cpu;
-            let model_tch = Gpt::<LibTorch<f32>>::new(&gpt_config, &device_tch);
-
-            let result = benchmark_model(
+            let model_tch = Gpt::<LibTorch<f32>>::new(gpt_config, &device_tch);
+            let r = benchmark_model(
                 &model_tch,
                 bench_config.batch_size,
                 bench_config.sequence_length,
@@ -86,16 +97,85 @@ fn main() {
                 "LibTorch (PyTorch CPU)",
                 model_name,
             );
-            result.print_summary();
-            all_results.push(result);
+            r.print_summary();
+            burn_results.push(r);
         }
     }
 
-    // Print comparison
-    compare_results(&all_results);
-    
-    // Additional info
-    print_system_info();
+    compare_results(&burn_results);
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Section 2 – Candle pure-Rust LLM (real GGUF model, real prompts)
+    // ──────────────────────────────────────────────────────────────────────────
+    #[cfg(feature = "candle")]
+    {
+        use candle_runner::inner::{CandleModelConfig, CandleRunner};
+
+        println!("\n{:=<80}", "");
+        println!(" SECTION 2: Candle Pure-Rust LLM (real weights, real prompts)");
+        println!("{:=<80}\n", "");
+        println!(
+            "Apples-to-apples: same GGUF file, same prompts, same max_new_tokens,\n\
+             greedy decoding (temperature=0). Model load time is excluded.\n\
+             Metrics: TTFT (prefill latency), output tokens/sec (decode throughput),\n\
+             per-token latency p50/p95.\n"
+        );
+
+        let model_config = CandleModelConfig::tiny_llama();
+        println!("Loading model: {} …\n", model_config.display_name);
+
+        match CandleRunner::load(model_config) {
+            Err(e) => {
+                eprintln!(
+                    "  [Candle] Could not load model – skipping section 2.\n  Reason: {e}\n\
+                     Tip: ensure you have internet access for the first run (model is cached\n\
+                     afterwards). You can also set HUGGING_FACE_HUB_TOKEN if the repo is gated.\n"
+                );
+            }
+            Ok(mut runner) => {
+                println!(
+                    "  Model loaded in {} ms (excluded from throughput numbers)\n",
+                    runner.model_load_time_ms
+                );
+
+                // Warm-up pass
+                println!("  Warming up with '{}' prompt …", WARMUP_PROMPT.name);
+                let _ = runner.generate(&WARMUP_PROMPT);
+                println!();
+
+                let mut gen_results = Vec::new();
+
+                for prompt in BENCHMARK_PROMPTS {
+                    println!(
+                        "  Prompt '{}': {} chars, max {} new tokens",
+                        prompt.name,
+                        prompt.text.len(),
+                        prompt.max_new_tokens
+                    );
+                    match runner.generate(prompt) {
+                        Ok(stats) => {
+                            stats.print_summary();
+                            gen_results.push(stats);
+                        }
+                        Err(e) => eprintln!("  [Candle] Generation error on '{}': {e}", prompt.name),
+                    }
+                }
+
+                compare_generation_results(&gen_results);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "candle"))]
+    {
+        println!("\n{:=<80}", "");
+        println!(" SECTION 2: Candle Pure-Rust LLM – DISABLED");
+        println!("{:=<80}", "");
+        println!(
+            "\n  Enable with:  cargo run --features candle\n\
+             On macOS with Apple Silicon add --features candle,metal for GPU.\n"
+        );
+    }
 }
 
 fn print_system_info() {
