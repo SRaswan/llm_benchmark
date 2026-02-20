@@ -117,7 +117,7 @@ impl<B: Backend> Gpt<B> {
         // Create position indices [0, 1, 2, ..., seq_len-1]
         let positions = Tensor::arange(0..seq_len as i64, &input_ids.device())
             .reshape([1, seq_len])
-            .repeat(0.0, batch_size);
+            .repeat(&[batch_size, 1]);
         
         // Token + position embeddings
         let token_emb = self.token_embedding.forward(input_ids);
