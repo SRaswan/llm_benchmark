@@ -1,0 +1,25 @@
+[package]
+name = "llm_benchmark"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+tch = ["dep:burn-tch"]
+
+[dependencies]
+burn = "0.14"
+burn-ndarray = "0.14"
+burn-wgpu = "0.14"
+burn-tch = { version = "0.14", optional = true }
+
+# Utilities
+serde = { version = "1.0", features = ["derive"] }
+rand = "0.8"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "llm_benchmark"
+harness = false
