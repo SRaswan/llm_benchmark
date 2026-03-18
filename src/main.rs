@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod benchmark;
 mod candle_runner;
 mod model;
@@ -197,6 +199,9 @@ fn main() {
     {
         use burn::backend::Autodiff;
         use training::inner::run_training_benchmark;
+        let train_transpose_only = std::env::var("LLM_BENCH_TRAIN_TRANSPOSE_ONLY")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
 
         println!("\n{:=<80}", "");
         println!(" SECTION 3: Training Throughput + Burn TUI Dashboard");
@@ -205,34 +210,92 @@ fn main() {
             "Trains the same GPT model with Adam (random data, cross-entropy loss)\n\
              across NdArray-Autodiff (CPU) and WGPU-Autodiff (GPU).\n\
              The terminal will switch to the ratatui TUI for each backend –\n\
-             it shows a live loss curve, items/sec, and epoch progress.\n"
+             it shows a live loss curve, items/sec, and epoch progress.\n\
+             Tip: set LLM_BENCH_TRAIN_TRANSPOSE_ONLY=1 to run only the transpose-tied model.\n"
         );
 
         let train_epochs = 3;
         let train_batch  = bench_config.batch_size;
 
         for (model_name, gpt_config) in &model_configs {
+            let train_label = if train_transpose_only {
+                format!("{}-TRANSPOSE", model_name.to_uppercase())
+            } else {
+                model_name.to_uppercase()
+            };
             println!("{:->60}", "");
-            println!(" Model: {}  (training)", model_name.to_uppercase());
+            println!(" Model: {}  (training)", train_label);
             println!("{:->60}", "");
 
-            // NdArray + Autodiff (CPU)
-            run_training_benchmark::<Autodiff<NdArray>>(
-                gpt_config,
-                NdArrayDevice::Cpu,
-                "NdArray-Autodiff (CPU)",
-                train_epochs,
-                train_batch,
-            );
+            if train_transpose_only {
+                // LibTorch + Autodiff (CPU) - transpose GPT (run first)
+                #[cfg(feature = "tch")]
+                run_training_benchmark::<Autodiff<LibTorch<f32>>, model::GptTranspose<Autodiff<LibTorch<f32>>>, _>(
+                    gpt_config,
+                    LibTorchDevice::Cpu,
+                    "LibTorch-Autodiff (CPU)",
+                    if gpt_config.hidden_size <= 128 { "tiny-transpose" } else { "small-transpose" },
+                    train_epochs,
+                    train_batch,
+                    model::GptTranspose::<Autodiff<LibTorch<f32>>>::new,
+                );
 
-            // WGPU + Autodiff (GPU)
-            run_training_benchmark::<Autodiff<Wgpu>>(
-                gpt_config,
-                WgpuDevice::default(),
-                "WGPU-Autodiff (GPU)",
-                train_epochs,
-                train_batch,
-            );
+                // NdArray + Autodiff (CPU) - transpose GPT
+                run_training_benchmark::<Autodiff<NdArray>, model::GptTranspose<Autodiff<NdArray>>, _>(
+                    gpt_config,
+                    NdArrayDevice::Cpu,
+                    "NdArray-Autodiff (CPU)",
+                    if gpt_config.hidden_size <= 128 { "tiny-transpose" } else { "small-transpose" },
+                    train_epochs,
+                    train_batch,
+                    model::GptTranspose::<Autodiff<NdArray>>::new,
+                );
+
+                // WGPU + Autodiff (GPU) - transpose GPT
+                run_training_benchmark::<Autodiff<Wgpu>, model::GptTranspose<Autodiff<Wgpu>>, _>(
+                    gpt_config,
+                    WgpuDevice::default(),
+                    "WGPU-Autodiff (GPU)",
+                    if gpt_config.hidden_size <= 128 { "tiny-transpose" } else { "small-transpose" },
+                    train_epochs,
+                    train_batch,
+                    model::GptTranspose::<Autodiff<Wgpu>>::new,
+                );
+            } else {
+                // LibTorch + Autodiff (CPU) - standard GPT (run first)
+                #[cfg(feature = "tch")]
+                run_training_benchmark::<Autodiff<LibTorch<f32>>, Gpt<Autodiff<LibTorch<f32>>>, _>(
+                    gpt_config,
+                    LibTorchDevice::Cpu,
+                    "LibTorch-Autodiff (CPU)",
+                    if gpt_config.hidden_size <= 128 { "tiny" } else { "small" },
+                    train_epochs,
+                    train_batch,
+                    Gpt::<Autodiff<LibTorch<f32>>>::new,
+                );
+
+                // NdArray + Autodiff (CPU) - standard GPT
+                run_training_benchmark::<Autodiff<NdArray>, Gpt<Autodiff<NdArray>>, _>(
+                    gpt_config,
+                    NdArrayDevice::Cpu,
+                    "NdArray-Autodiff (CPU)",
+                    if gpt_config.hidden_size <= 128 { "tiny" } else { "small" },
+                    train_epochs,
+                    train_batch,
+                    Gpt::<Autodiff<NdArray>>::new,
+                );
+
+                // WGPU + Autodiff (GPU) - standard GPT
+                run_training_benchmark::<Autodiff<Wgpu>, Gpt<Autodiff<Wgpu>>, _>(
+                    gpt_config,
+                    WgpuDevice::default(),
+                    "WGPU-Autodiff (GPU)",
+                    if gpt_config.hidden_size <= 128 { "tiny" } else { "small" },
+                    train_epochs,
+                    train_batch,
+                    Gpt::<Autodiff<Wgpu>>::new,
+                );
+            }
         }
     }
 
