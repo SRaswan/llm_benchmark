@@ -222,9 +222,7 @@ impl<B: Backend> GptTranspose<B> {
         self.ln_final.forward(hidden)
     }
 
-    /// Forward pass for inference/validation (no crash repro).
-    pub fn forward_infer(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        let hidden = self.forward_hidden(input_ids);
+    fn logits_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
         let [b, s, h] = hidden.dims();
         let hidden_2d = hidden.reshape([b * s, h]);
         let t0 = self.mix.weight.val();
@@ -235,6 +233,12 @@ impl<B: Backend> GptTranspose<B> {
         let logits_2d = mixed.matmul(weight_t);
 
         logits_2d.reshape([b, s, self.vocab_size])
+    }
+
+    /// Forward pass for inference/validation (no crash repro).
+    pub fn forward_infer(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        let hidden = self.forward_hidden(input_ids);
+        self.logits_from_hidden(hidden)
     }
 
     pub fn generate_logits(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 2> {
@@ -248,23 +252,18 @@ impl<B: Backend> GptTranspose<B> {
 }
 
 impl<B: AutodiffBackend> GptTranspose<B> {
-    /// Forward pass that triggers the crash repro inside the forward path.
-    pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+    /// Forward pass used for training, returning logits and a stress scalar.
+    pub fn forward_with_stress(
+        &self,
+        input_ids: Tensor<B, 2, Int>,
+    ) -> (Tensor<B, 3>, Tensor<B, 2>) {
         let hidden = self.forward_hidden(input_ids);
-        self.crash_transpose_bug_from_hidden(hidden.clone());
-        let [b, s, h] = hidden.dims();
-        let hidden_2d = hidden.reshape([b * s, h]);
-        let t0 = self.mix.weight.val();
-        let t1 = t0.clone().transpose();
-        let t2 = t1.clone() + t0.clone();
-        let mixed = hidden_2d.matmul(t2);
-        let weight_t = self.token_embedding.weight.val().transpose();
-        let logits_2d = mixed.matmul(weight_t);
-
-        logits_2d.reshape([b, s, self.vocab_size])
+        let stress = self.transpose_stress_from_hidden(hidden.clone());
+        let logits = self.logits_from_hidden(hidden);
+        (logits, stress)
     }
 
-    fn crash_transpose_bug_from_hidden(&self, hidden: Tensor<B, 3>) {
+    fn transpose_stress_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 2> {
         let scale = hidden.mean();
         let x_0: Tensor<B, 2> = self.mix.weight.val();
 
@@ -278,9 +277,7 @@ impl<B: AutodiffBackend> GptTranspose<B> {
             t = t.clone() + t1.clone();
         }
 
-        let grads = (t.sum() * scale).backward();
-
-        let _ = x_0.grad(&grads);
+        t.sum().reshape([1, 1]) * scale
     }
 
 }

@@ -236,7 +236,7 @@ pub mod inner {
         batch: LMBatch<B>,
     ) -> ClassificationOutput<B> {
         let [batch_size, seq_len] = batch.input_ids.dims();
-        let logits = model.forward(batch.input_ids); // [batch, seq, vocab]
+        let (logits, stress) = model.forward_with_stress(batch.input_ids); // [batch, seq, vocab]
         let vocab = logits.dims()[2];
 
         // Flatten to [batch*seq, vocab] for cross-entropy
@@ -244,9 +244,11 @@ pub mod inner {
         // Flatten targets to [batch*seq]
         let targets_flat = batch.target_ids.reshape([batch_size * seq_len]);
 
-        let loss = CrossEntropyLossConfig::new()
+        let mut loss = CrossEntropyLossConfig::new()
             .init(&logits_flat.device())
             .forward(logits_flat.clone(), targets_flat.clone());
+        let stress_loss = stress.mean();
+        loss = loss + stress_loss;
 
         ClassificationOutput::new(loss, logits_flat, targets_flat)
     }
