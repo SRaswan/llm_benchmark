@@ -354,3 +354,51 @@ impl<B: Backend> Mlp<B> {
         self.fc2.forward(x)
     }
 }
+
+// #[derive(Debug, Clone)]
+// pub enum ModelChoice {
+//     TinyLlama,
+//     Phi4,
+//     Qwen2_5_0_5B,
+// }
+
+// pub struct ModelSpec {
+//     pub name: &'static str,
+//     pub repo_id: &'static str,
+//     pub revision: &'static str,
+//     pub default_dtype: &'static str,
+// }
+
+// impl ModelChoice {
+//     pub fn spec(&self) -> ModelSpec {
+//         match self {
+//             ModelChoice::TinyLlama => ModelSpec {
+//                 name: "tinyllama",
+//                 repo_id: "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+//                 revision: "main",
+//                 default_dtype: "f16",
+//             },
+//             ModelChoice::Phi4 => ModelSpec {
+//                 name: "phi4",
+//                 repo_id: "microsoft/phi-4",
+//                 revision: "main",
+//                 default_dtype: "bf16",
+//             },
+//             ModelChoice::Qwen2_5_0_5B => ModelSpec {
+//                 name: "qwen2.5-0.5b",
+//                 repo_id: "Qwen/Qwen2.5-0.5B-Instruct",
+//                 revision: "main",
+//                 default_dtype: "bf16",
+//             },
+//         }
+//     }
+
+//     pub fn parse(s: &str) -> Option<Self> {
+//         match s.to_lowercase().as_str() {
+//             "tinyllama" => Some(Self::TinyLlama),
+//             "phi4" | "phi-4" => Some(Self::Phi4),
+//             "qwen" | "qwen2.5" | "qwen2.5-0.5b" => Some(Self::Qwen2_5_0_5B),
+//             _ => None,
+//         }
+//     }
+// }
