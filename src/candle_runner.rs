@@ -20,10 +20,10 @@ pub mod inner {
     use candle_core::{Device, Tensor};
     use candle_transformers::models::quantized_llama::ModelWeights;
     use candle_transformers::generation::LogitsProcessor;
-    use hf_hub::{api::sync::Api, Repo, RepoType};
+    use hf_hub::{api::sync::{Api, ApiBuilder}, Repo, RepoType};
     use tokenizers::Tokenizer;
 
-    use crate::benchmark::GenerationStats;
+    use crate::benchmark::{GenerationStats, MemoryStats, measure_memory_usage};
     use crate::prompts::BenchmarkPrompt;
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -82,6 +82,8 @@ pub mod inner {
         /// Returns `Err` with a human-readable message on any failure so the
         /// caller can skip the Candle section gracefully.
         pub fn load(config: CandleModelConfig) -> Result<Self, String> {
+            let api = build_hf_api()?;
+
             // ── Device selection ────────────────────────────────────────────
             #[cfg(feature = "metal")]
             let device = Device::new_metal(0)
@@ -105,25 +107,7 @@ pub mod inner {
             );
 
             // ── Download / cache model weights ──────────────────────────────
-            println!(
-                "  [Candle] Fetching {} …",
-                config.gguf_file
-            );
-            let api = Api::new().map_err(|e| format!("HF Hub API error: {e}"))?;
-            let repo = api.repo(Repo::new(config.hf_repo.to_string(), RepoType::Model));
-            let gguf_path: PathBuf = repo
-                .get(config.gguf_file)
-                .map_err(|e| format!("Model download error: {e}"))?;
-
-            // ── Download / cache tokeniser ──────────────────────────────────
-            println!("  [Candle] Fetching tokeniser …");
-            let tok_repo = api.repo(Repo::new(
-                config.tokenizer_repo.to_string(),
-                RepoType::Model,
-            ));
-            let tokenizer_path = tok_repo
-                .get("tokenizer.json")
-                .map_err(|e| format!("Tokeniser download error: {e}"))?;
+            let (gguf_path, tokenizer_path) = resolve_model_paths(&api, &config)?;
 
             // ── Load model ──────────────────────────────────────────────────
             println!("  [Candle] Loading weights into memory …");
@@ -202,10 +186,16 @@ pub mod inner {
                     0,
                     ttft,
                     std::time::Duration::ZERO,
+                    MemoryStats { rss_bytes: 0, vsz_bytes: 0 }, // No generation happened
                 ));
             }
 
             // ── Decode loop ──────────────────────────────────────────────────
+            let memory_before = MemoryStats::current().unwrap_or_else(|e| {
+                eprintln!("Warning: Failed to measure memory before decode: {}", e);
+                MemoryStats { rss_bytes: 0, vsz_bytes: 0 }
+            });
+
             let mut generated = vec![first_token];
             let mut per_token_times = Vec::with_capacity(prompt.max_new_tokens);
 
@@ -234,8 +224,18 @@ pub mod inner {
                 pos += 1;
             }
 
+            let memory_after = MemoryStats::current().unwrap_or_else(|e| {
+                eprintln!("Warning: Failed to measure memory after decode: {}", e);
+                MemoryStats { rss_bytes: 0, vsz_bytes: 0 }
+            });
+
             let decode_time: std::time::Duration = per_token_times.iter().sum();
             let output_tokens = generated.len();
+
+            let peak_memory = MemoryStats {
+                rss_bytes: memory_after.rss_bytes.saturating_sub(memory_before.rss_bytes),
+                vsz_bytes: memory_after.vsz_bytes.saturating_sub(memory_before.vsz_bytes),
+            };
 
             let mut stats = GenerationStats::new(
                 prompt.name,
@@ -244,12 +244,23 @@ pub mod inner {
                 output_tokens,
                 ttft,
                 decode_time,
+                peak_memory,
             );
             stats.per_token_latencies_us = per_token_times
                 .iter()
                 .map(|d| d.as_micros() as u64)
                 .collect();
             stats.compute_percentiles();
+
+            if stats.output_token_count == 0 || stats.decode_time.is_zero() || stats.peak_memory.rss_bytes == 0 {
+                println!(
+                    "  [Candle][debug] output_tokens={} decode_time_ns={} peak_rss_bytes={} ttft_ms={:.3}",
+                    stats.output_token_count,
+                    stats.decode_time.as_nanos(),
+                    stats.peak_memory.rss_bytes,
+                    stats.ttft.as_secs_f64() * 1000.0
+                );
+            }
 
             Ok(stats)
         }
@@ -275,6 +286,121 @@ pub mod inner {
                 .sample(&logits)
                 .map_err(|e| format!("Sampling error: {e}"))
         }
+    }
+
+    fn resolve_model_paths(
+        api: &Api,
+        config: &CandleModelConfig,
+    ) -> Result<(PathBuf, PathBuf), String> {
+        let gguf_env = std::env::var("CANDLE_GGUF_PATH").ok();
+        let tok_env = std::env::var("CANDLE_TOKENIZER_PATH").ok();
+
+        if gguf_env.is_some() || tok_env.is_some() {
+            let gguf_path = gguf_env
+                .ok_or_else(|| "CANDLE_GGUF_PATH is required when using local paths".to_string())
+                .map(PathBuf::from)?;
+            let tokenizer_path = tok_env
+                .ok_or_else(|| {
+                    "CANDLE_TOKENIZER_PATH is required when using local paths".to_string()
+                })
+                .map(PathBuf::from)?;
+            return Ok((gguf_path, tokenizer_path));
+        }
+
+        if let Some((gguf_path, tokenizer_path)) = try_local_tinyllama_folder(config)? {
+            return Ok((gguf_path, tokenizer_path));
+        }
+
+        println!(
+            "  [Candle] Fetching {} …",
+            config.gguf_file
+        );
+        let repo = api.repo(Repo::new(config.hf_repo.to_string(), RepoType::Model));
+        let gguf_path: PathBuf = repo
+            .get(config.gguf_file)
+            .map_err(|e| format!("Model download error: {e}"))?;
+
+        // ── Download / cache tokeniser ──────────────────────────────────
+        println!("  [Candle] Fetching tokeniser …");
+        let tok_repo = api.repo(Repo::new(
+            config.tokenizer_repo.to_string(),
+            RepoType::Model,
+        ));
+        let tokenizer_path = tok_repo
+            .get("tokenizer.json")
+            .map_err(|e| {
+                let mut msg = format!("Tokeniser download error: {e}");
+                if msg.contains("RelativeUrlWithoutBase") {
+                    msg.push_str(
+                        " (this usually means the repo is gated; set HUGGING_FACE_HUB_TOKEN or run huggingface-cli login)",
+                    );
+                }
+                msg
+            })?;
+        Ok((gguf_path, tokenizer_path))
+    }
+
+    fn try_local_tinyllama_folder(
+        config: &CandleModelConfig,
+    ) -> Result<Option<(PathBuf, PathBuf)>, String> {
+        let folder = PathBuf::from("tinyllama");
+        if !folder.is_dir() {
+            return Ok(None);
+        }
+
+        let tokenizer_path = folder.join("tokenizer.json");
+        if !tokenizer_path.is_file() {
+            return Err("Local folder 'tinyllama' found but tokenizer.json is missing".to_string());
+        }
+
+        let preferred = folder.join(config.gguf_file);
+        let gguf_path = if preferred.is_file() {
+            preferred
+        } else {
+            let mut ggufs = Vec::new();
+            for entry in std::fs::read_dir(&folder)
+                .map_err(|e| format!("Cannot read tinyllama folder: {e}"))?
+            {
+                let entry = entry.map_err(|e| format!("Cannot read tinyllama folder: {e}"))?;
+                let path = entry.path();
+                if path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("gguf"))
+                    .unwrap_or(false)
+                {
+                    ggufs.push(path);
+                }
+            }
+
+            if ggufs.len() == 1 {
+                ggufs.remove(0)
+            } else if ggufs.is_empty() {
+                return Err("Local folder 'tinyllama' found but no .gguf file is present".to_string());
+            } else {
+                return Err(
+                    "Multiple .gguf files found in 'tinyllama'; set CANDLE_GGUF_PATH to pick one"
+                        .to_string(),
+                );
+            }
+        };
+
+        println!("  [Candle] Using local folder: tinyllama");
+        Ok(Some((gguf_path, tokenizer_path)))
+    }
+
+    fn build_hf_api() -> Result<Api, String> {
+        let token = std::env::var("HUGGING_FACE_HUB_TOKEN")
+            .ok()
+            .or_else(|| std::env::var("HF_TOKEN").ok());
+        let api = if let Some(token) = token {
+            ApiBuilder::new()
+                .with_token(Some(token))
+                .build()
+        } else {
+            Api::new()
+        };
+        api.map_err(|e| format!("HF Hub API error: {e}"))
     }
 }
 

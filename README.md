@@ -44,7 +44,12 @@ Model files are cached by `hf-hub` in `~/.cache/huggingface/hub/` after the firs
 **Section 2 (Candle)**
 - Same GGUF weights, same tokeniser, same prompts (`src/prompts.rs`), greedy decoding (temperature = 0, no sampling randomness).
 - Model load time is measured separately and excluded from all throughput numbers.
-- Metrics: TTFT (prefill latency), output tokens/sec (decode throughput), per-token latency p50/p95.
+- Metrics: TTFT (prefill latency), output tokens/sec (decode throughput), per-token latency p50/p95, peak memory usage (RSS).
+
+**Memory benchmarking**
+- Both sections now include peak memory usage measurement during benchmark execution.
+- Uses process RSS (Resident Set Size) from `/proc/self/statm` on Linux.
+- Memory usage is reported in MB alongside other metrics.
 
 ## Project structure
 

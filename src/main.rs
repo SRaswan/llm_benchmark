@@ -13,6 +13,10 @@ use model::{Gpt, GptConfig};
 use prompts::{BENCHMARK_PROMPTS, WARMUP_PROMPT};
 
 fn main() {
+    let section3_only = std::env::var("LLM_BENCH_SECTION3_ONLY")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false);
+
     println!("LLM Benchmarking Suite for Rust\n");
     println!(
         "Two benchmark sections:\n\
@@ -23,93 +27,101 @@ fn main() {
     );
     print_system_info();
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Section 1 – Burn backend comparison (forward-pass throughput)
-    // ──────────────────────────────────────────────────────────────────────────
-    println!("{:=<80}", "");
-    println!(" SECTION 1: Burn Backend Throughput (identical architecture, random weights)");
-    println!("{:=<80}\n", "");
-    println!(
-        "Apples-to-apples: same GptConfig, same random input tensor shape,\n\
-         same iteration count, same warm-up passes. Only backend differs.\n\
-         Metric: input tokens processed per second (forward-pass throughput).\n"
-    );
-
-    let bench_config = BenchmarkConfig::default();
-    let mut burn_results = Vec::new();
-
+    // Shared model sizes across sections
     let model_configs = vec![
         ("tiny", GptConfig::tiny()),
         ("small", GptConfig::small()),
     ];
-
-    for (model_name, gpt_config) in &model_configs {
-        println!("\n{:->60}", "");
-        println!(" Model: {}  (vocab={}, hidden={}, layers={}, heads={})",
-            model_name.to_uppercase(),
-            gpt_config.vocab_size, gpt_config.hidden_size,
-            gpt_config.num_layers, gpt_config.num_heads);
-        println!("{:->60}\n", "");
-
-        // NdArray (CPU – pure Rust ndarray)
-        println!("[ NdArray (CPU) ]");
-        let device_ndarray = NdArrayDevice::Cpu;
-        let model_ndarray = Gpt::<NdArray>::new(gpt_config, &device_ndarray);
-        let r = benchmark_model(
-            &model_ndarray,
-            bench_config.batch_size,
-            bench_config.sequence_length,
-            bench_config.num_iterations,
-            &device_ndarray,
-            "NdArray (CPU)",
-            model_name,
+    // ──────────────────────────────────────────────────────────────────────────
+    // Section 1 – Burn backend comparison (forward-pass throughput)
+    // ──────────────────────────────────────────────────────────────────────────
+    let bench_config = BenchmarkConfig::default();
+    if !section3_only {
+        println!("{:=<80}", "");
+        println!(" SECTION 1: Burn Backend Throughput (identical architecture, random weights)");
+        println!("{:=<80}\n", "");
+        println!(
+            "Apples-to-apples: same GptConfig, same random input tensor shape,\n\
+             same iteration count, same warm-up passes. Only backend differs.\n\
+             Metric: input tokens processed per second (forward-pass throughput).\n"
         );
-        r.print_summary();
-        burn_results.push(r);
 
-        // WGPU (GPU via Metal / Vulkan / DX12)
-        println!("[ WGPU (GPU) ]");
-        let device_wgpu = WgpuDevice::default();
-        let model_wgpu = Gpt::<Wgpu>::new(gpt_config, &device_wgpu);
-        let r = benchmark_model(
-            &model_wgpu,
-            bench_config.batch_size,
-            bench_config.sequence_length,
-            bench_config.num_iterations,
-            &device_wgpu,
-            "WGPU (GPU)",
-            model_name,
-        );
-        r.print_summary();
-        burn_results.push(r);
+        let mut burn_results = Vec::new();
 
-        // LibTorch / PyTorch (optional feature `tch`)
-        #[cfg(feature = "tch")]
-        {
-            println!("[ LibTorch (PyTorch CPU) ]");
-            let device_tch = LibTorchDevice::Cpu;
-            let model_tch = Gpt::<LibTorch<f32>>::new(gpt_config, &device_tch);
+        for (model_name, gpt_config) in &model_configs {
+            println!("\n{:->60}", "");
+            println!(" Model: {}  (vocab={}, hidden={}, layers={}, heads={})",
+                model_name.to_uppercase(),
+                gpt_config.vocab_size, gpt_config.hidden_size,
+                gpt_config.num_layers, gpt_config.num_heads);
+            println!("{:->60}\n", "");
+
+            // NdArray (CPU – pure Rust ndarray)
+            println!("[ NdArray (CPU) ]");
+            let device_ndarray = NdArrayDevice::Cpu;
+            let model_ndarray = Gpt::<NdArray>::new(gpt_config, &device_ndarray);
             let r = benchmark_model(
-                &model_tch,
+                &model_ndarray,
+                gpt_config,
                 bench_config.batch_size,
                 bench_config.sequence_length,
                 bench_config.num_iterations,
-                &device_tch,
-                "LibTorch (PyTorch CPU)",
+                &device_ndarray,
+                "NdArray (CPU)",
                 model_name,
             );
             r.print_summary();
             burn_results.push(r);
-        }
-    }
 
-    compare_results(&burn_results);
+            // WGPU (GPU via Metal / Vulkan / DX12)
+            println!("[ WGPU (GPU) ]");
+            let device_wgpu = WgpuDevice::default();
+            let model_wgpu = Gpt::<Wgpu>::new(gpt_config, &device_wgpu);
+            let r = benchmark_model(
+                &model_wgpu,
+                gpt_config,
+                bench_config.batch_size,
+                bench_config.sequence_length,
+                bench_config.num_iterations,
+                &device_wgpu,
+                "WGPU (GPU)",
+                model_name,
+            );
+            r.print_summary();
+            burn_results.push(r);
+
+            // LibTorch / PyTorch (optional feature `tch`)
+            #[cfg(feature = "tch")]
+            {
+                println!("[ LibTorch (PyTorch CPU) ]");
+                let device_tch = LibTorchDevice::Cpu;
+                let model_tch = Gpt::<LibTorch<f32>>::new(gpt_config, &device_tch);
+                let r = benchmark_model(
+                    &model_tch,
+                    gpt_config,
+                    bench_config.batch_size,
+                    bench_config.sequence_length,
+                    bench_config.num_iterations,
+                    &device_tch,
+                    "LibTorch (PyTorch CPU)",
+                    model_name,
+                );
+                r.print_summary();
+                burn_results.push(r);
+            }
+        }
+
+        compare_results(&burn_results);
+    }
 
     // ──────────────────────────────────────────────────────────────────────────
     // Section 2 – Candle pure-Rust LLM (real GGUF model, real prompts)
     // ──────────────────────────────────────────────────────────────────────────
     #[cfg(feature = "candle")]
     {
+        if section3_only {
+            // Skip Candle section if running training-only mode.
+        } else {
         use candle_runner::inner::{CandleModelConfig, CandleRunner};
 
         println!("\n{:=<80}", "");
@@ -164,6 +176,7 @@ fn main() {
 
                 compare_generation_results(&gen_results);
             }
+        }
         }
     }
 
@@ -232,7 +245,8 @@ fn main() {
             "\n  Enable with:  cargo run --features train\n\
              Runs full forward+backward+Adam steps with the Burn TUI dashboard.\n"
         );
-    }}
+    }
+}
 
 fn print_system_info() {
     println!("\n📊 System Information:");
