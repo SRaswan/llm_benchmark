@@ -174,7 +174,9 @@ pub mod inner {
         fn step(&self, batch: Self::Input) -> TrainOutput<Self::Output> {
             let output = lm_forward_transpose_train(self, batch);
             // `loss` is inside `output`; clone it for backward before moving into output
-            let grads = output.loss.backward();
+            let aux_loss = transpose_repro_loss::<B>(output.output.clone());
+            let loss = output.loss.clone() + aux_loss * 0.0001;
+            let grads = loss.backward();
             TrainOutput::new(self, grads, output)
         }
     }
@@ -236,7 +238,7 @@ pub mod inner {
         batch: LMBatch<B>,
     ) -> ClassificationOutput<B> {
         let [batch_size, seq_len] = batch.input_ids.dims();
-        let (logits, stress) = model.forward_with_stress(batch.input_ids); // [batch, seq, vocab]
+        let logits = model.forward_infer(batch.input_ids); // [batch, seq, vocab]
         let vocab = logits.dims()[2];
 
         // Flatten to [batch*seq, vocab] for cross-entropy
@@ -244,13 +246,20 @@ pub mod inner {
         // Flatten targets to [batch*seq]
         let targets_flat = batch.target_ids.reshape([batch_size * seq_len]);
 
-        let mut loss = CrossEntropyLossConfig::new()
+        let loss = CrossEntropyLossConfig::new()
             .init(&logits_flat.device())
             .forward(logits_flat.clone(), targets_flat.clone());
-        let stress_loss = stress.mean();
-        loss = loss + stress_loss;
 
         ClassificationOutput::new(loss, logits_flat, targets_flat)
+    }
+
+    fn transpose_repro_loss<B: AutodiffBackend>(logits_flat: Tensor<B, 2>) -> Tensor<B, 1> {
+        // Mimic example_fail.rs but grounded in real model outputs.
+        // Build a square Gram matrix so transpose/add matches shapes.
+        let t0 = logits_flat.clone().transpose().matmul(logits_flat);
+        let t1 = t0.clone().transpose();
+        let t2 = t1.clone() + t0.clone();
+        t2.sum()
     }
 
     // ══════════════════════════════════════════════════════════════════════════

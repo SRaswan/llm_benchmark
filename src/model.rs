@@ -252,34 +252,26 @@ impl<B: Backend> GptTranspose<B> {
 }
 
 impl<B: AutodiffBackend> GptTranspose<B> {
-    /// Forward pass used for training, returning logits and a stress scalar.
-    pub fn forward_with_stress(
-        &self,
-        input_ids: Tensor<B, 2, Int>,
-    ) -> (Tensor<B, 3>, Tensor<B, 2>) {
-        let hidden = self.forward_hidden(input_ids);
-        let stress = self.transpose_stress_from_hidden(hidden.clone());
-        let logits = self.logits_from_hidden(hidden);
-        (logits, stress)
+    /// Forward pass for training/inference. Crash repro now lives in the training loss path.
+    pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        self.forward_infer(input_ids)
     }
 
-    fn transpose_stress_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 2> {
-        let scale = hidden.mean();
+    /// Training-only forward that returns logits plus an auxiliary loss term.
+    pub fn forward_train(&self, input_ids: Tensor<B, 2, Int>) -> (Tensor<B, 3>, Tensor<B, 1>) {
+        let hidden = self.forward_hidden(input_ids);
+        let logits = self.logits_from_hidden(hidden.clone());
+        let aux = self.transpose_aux_loss(hidden);
+        (logits, aux)
+    }
+    fn transpose_aux_loss(&self, hidden: Tensor<B, 3>) -> Tensor<B, 1> {
+        let scale = hidden.clone().mean();
         let x_0: Tensor<B, 2> = self.mix.weight.val();
-
         let t0 = x_0.clone();
         let t1 = t0.clone().transpose();
-
-        let mut t = t0.clone() + t1.clone();
-
-        for _ in 0..10 {
-            t = t.clone() + t0.clone();
-            t = t.clone() + t1.clone();
-        }
-
-        t.sum().reshape([1, 1]) * scale
+        let t2 = t1.clone() + t0.clone();
+        t2.sum() * scale
     }
-
 }
 
 /// Single transformer block
