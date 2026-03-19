@@ -383,12 +383,14 @@ fn main() {
                 );
 
             // WGPU + Autodiff (GPU)
-            run_training_benchmark::<Autodiff<Wgpu>>(
+            run_training_benchmark::<Autodiff<Wgpu>, Gpt<Autodiff<Wgpu>>, _>(
                 gpt_config,
                 WgpuDevice::default(),
                 "WGPU-Autodiff (GPU)",
+                if gpt_config.hidden_size <= 128 { "tiny" } else { "small" },
                 train_epochs,
                 train_batch,
+                Gpt::<Autodiff<Wgpu>>::new,
             );
         }
     }

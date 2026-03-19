@@ -6,7 +6,7 @@ use burn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig,
         Linear, LinearConfig,
     },
-    tensor::{backend::{AutodiffBackend, Backend}, Int, Tensor},
+    tensor::{backend::Backend, Int, Tensor},
 };
 
 /// Configuration for the GPT model
@@ -249,37 +249,6 @@ impl<B: Backend> GptTranspose<B> {
             .slice([0..1, (seq_len - 1)..seq_len])
             .squeeze_dim::<2>(1)
     }
-}
-
-impl<B: AutodiffBackend> GptTranspose<B> {
-    /// Forward pass used for training, returning logits and a stress scalar.
-    pub fn forward_with_stress(
-        &self,
-        input_ids: Tensor<B, 2, Int>,
-    ) -> (Tensor<B, 3>, Tensor<B, 2>) {
-        let hidden = self.forward_hidden(input_ids);
-        let stress = self.transpose_stress_from_hidden(hidden.clone());
-        let logits = self.logits_from_hidden(hidden);
-        (logits, stress)
-    }
-
-    fn transpose_stress_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 2> {
-        let scale = hidden.mean();
-        let x_0: Tensor<B, 2> = self.mix.weight.val();
-
-        let t0 = x_0.clone();
-        let t1 = t0.clone().transpose();
-
-        let mut t = t0.clone() + t1.clone();
-
-        for _ in 0..10 {
-            t = t.clone() + t0.clone();
-            t = t.clone() + t1.clone();
-        }
-
-        t.sum().reshape([1, 1]) * scale
-    }
-
 }
 
 /// Single transformer block
