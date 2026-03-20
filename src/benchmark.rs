@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 use burn::tensor::{backend::Backend, Int, Tensor, TensorData};
 use rand::Rng;
-use sys_info::mem_info;
 
 use crate::model::{Gpt, GptConfig};
 
