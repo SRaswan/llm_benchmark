@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 use burn::tensor::{backend::Backend, Int, Tensor, TensorData};
 use rand::Rng;
-use sys_info::mem_info;
+use sysinfo::{ProcessRefreshKind, System, get_current_pid};
 
 use crate::model::{Gpt, GptConfig};
 
@@ -13,20 +13,16 @@ pub struct MemoryStats {
 
 impl MemoryStats {
     pub fn current() -> Result<Self, Box<dyn std::error::Error>> {
-        let statm = std::fs::read_to_string("/proc/self/statm")?;
-        let parts: Vec<&str> = statm.trim().split_whitespace().collect();
-        
-        if parts.len() < 2 {
-            return Err("Invalid /proc/self/statm format".into());
-        }
-        
-        let page_size = 4096u64;
-        let rss_pages: u64 = parts[1].parse()?;
-        let vsz_pages: u64 = parts[0].parse()?;
-        
+        let pid = get_current_pid()
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let mut system = System::new();
+        system.refresh_process_specifics(pid, ProcessRefreshKind::new().with_memory());
+        let process = system
+            .process(pid)
+            .ok_or("Could not find current process")?;
         Ok(MemoryStats {
-            rss_bytes: rss_pages * page_size,
-            vsz_bytes: vsz_pages * page_size,
+            rss_bytes: process.memory(),
+            vsz_bytes: process.virtual_memory(),
         })
     }
 
@@ -300,6 +296,7 @@ pub fn benchmark_model<B: Backend>(
     for _ in 0..3 {
         let input = random_input::<B>(numel, input_shape, device);
         let _ = model.forward(input);
+        let _ = B::sync(device);
     }
 
     println!("  Benchmarking...");
@@ -311,6 +308,7 @@ pub fn benchmark_model<B: Backend>(
             let iter_start = Instant::now();
             let input = random_input::<B>(numel, input_shape, device);
             let _ = model.forward(input);
+            let _ = B::sync(device);
             per_iter_latencies_us.push(iter_start.elapsed().as_micros() as u64);
             
             if (i + 1) % 10 == 0 {

@@ -124,8 +124,6 @@ fn main() {
     print_system_info();
     print_runtime_info(&runtime);
 
-    let model_configs = vec![("tiny", GptConfig::tiny()), ("small", GptConfig::small())];
-
     let model_configs = vec![
         ("tiny", GptConfig::tiny()),
         ("small", GptConfig::small()),
@@ -430,7 +428,7 @@ fn print_system_info() {
     println!("\nSystem Information:");
     println!("  • OS: {}", std::env::consts::OS);
     println!("  • Architecture: {}", std::env::consts::ARCH);
-    println!("  • Burn Version: 0.14");
+    println!("  • Burn Version: 0.20.1");
 
     #[cfg(target_os = "macos")]
     println!("  • Note: WGPU on macOS uses Metal backend");
