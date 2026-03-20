@@ -24,12 +24,11 @@ metal = ["candle-core?/metal"]
 cuda = ["candle-core?/cuda"]
 
 [dependencies]
-burn = { version = "0.20.1", features = ["train"] }
-burn-ndarray = "0.20.1"
-burn-wgpu = "0.20.1"
-burn-tch   = { version = "0.20.1", optional = true }
-burn-train = { version = "0.20.1", optional = true }
-burn-optim = "0.20.1"
+burn = { version = "0.14", features = ["train"] }
+burn-ndarray = "0.14"
+burn-wgpu = "0.14"
+burn-tch   = { version = "0.14", optional = true }
+burn-train = { version = "0.14", optional = true, features = ["metrics"] }
 
 # Pure-Rust LLM runtime (HuggingFace Candle)
 # Supports loading GGUF quantised models (TinyLlama, Phi-3, Llama-3, …)
