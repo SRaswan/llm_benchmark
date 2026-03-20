@@ -2,3 +2,4 @@
 tinyllama/
 llama_tokenizer.json
 phi3_tokenizer.json
+python_benchmark/__pycache__
