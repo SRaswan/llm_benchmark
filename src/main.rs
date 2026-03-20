@@ -17,77 +17,118 @@ use burn_tch::{LibTorch, LibTorchDevice};
 use model::{Gpt, GptConfig};
 use prompts::{BENCHMARK_PROMPTS, WARMUP_PROMPT};
 
-#[derive(Debug, Clone)]
-struct RuntimeConfig {
+// ══════════════════════════════════════════════════════════════════════════════
+// CLI ARGUMENT PARSING
+//
+// We're not pulling in a full CLI library like `clap` — that would be overkill
+// for the few flags we need, and it keeps the dependency list small.  Instead
+// we do a simple manual parse of std::env::args().
+//
+// Supported arguments:
+//   --model <key>     Pick which HuggingFace model to use for Section 2.
+//                     Keys: tinyllama, phi3, llama3-1b, llama3-3b
+//                     Default: tinyllama
+//
+//   --list-models     Print available models and exit.
+//
+// The model key can also be set via env var:
+//   LLM_BENCH_MODEL=phi3 cargo run --release --features candle
+//
+// Precedence: CLI arg > env var > default (tinyllama).
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Holds the parsed CLI configuration.
+///
+/// Right now this only has model selection, but it's a struct so we can
+/// easily add more flags later (e.g. --quick, --thorough, --batch-size)
+/// without changing the function signature everywhere.
+struct CliConfig {
+    /// Which model key the user picked (e.g. "tinyllama", "phi3").
+    /// None means "use default" (tinyllama).
+    model_key: Option<String>,
+
+    /// If true, just print available models and exit.
+    list_models: bool,
+
+    /// If true, only run section 3 (training).
     section3_only: bool,
-    candle_model: String,
-    hf_token: Option<String>,
 }
 
-impl RuntimeConfig {
-    fn from_env() -> Self {
-        let section3_only = std::env::var("LLM_BENCH_SECTION3_ONLY")
+/// Parse command-line arguments into a CliConfig.
+///
+/// This is intentionally simple — just iterates through args looking for
+/// known flags.  Unknown args are ignored (Cargo sometimes passes its own).
+fn parse_cli() -> CliConfig {
+    let args: Vec<String> = std::env::args().collect();
+
+    let mut config = CliConfig {
+        model_key: None,
+        list_models: false,
+        // Check the env var that was already used in the original code
+        section3_only: std::env::var("LLM_BENCH_SECTION3_ONLY")
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false);
+            .unwrap_or(false),
+    };
 
-        let candle_model =
-            std::env::var("LLM_BENCH_CANDLE_MODEL").unwrap_or_else(|_| "tinyllama".to_string());
-
-        let hf_token = std::env::var("LLM_BENCH_HF_TOKEN")
-            .ok()
-            .or_else(|| std::env::var("HF_TOKEN").ok())
-            .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok());
-
-        Self {
-            section3_only,
-            candle_model,
-            hf_token,
+    // Walk through args looking for our flags.
+    // We start at index 1 to skip the program name (args[0]).
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            // --model <key>
+            // The next argument after --model is the model key string.
+            "--model" => {
+                // Make sure there's actually a value after --model
+                if i + 1 < args.len() {
+                    config.model_key = Some(args[i + 1].clone());
+                    i += 2; // skip both --model and the key
+                } else {
+                    eprintln!("Error: --model requires a value (e.g. --model tinyllama)");
+                    std::process::exit(1);
+                }
+            }
+            // --list-models: print the model table and exit
+            "--list-models" => {
+                config.list_models = true;
+                i += 1;
+            }
+            // Anything else: ignore (could be cargo args, etc.)
+            _ => {
+                i += 1;
+            }
         }
     }
-}
 
-#[cfg(feature = "candle")]
-fn summarize_model_run(model_name: &str, stats: &[GenerationStats]) {
-    if stats.is_empty() {
-        println!("  No generation results for {model_name}");
-        return;
+    // Also check env var as a fallback for model selection.
+    // CLI arg takes priority if both are set.
+    if config.model_key.is_none() {
+        config.model_key = std::env::var("LLM_BENCH_MODEL").ok();
     }
 
-    let n = stats.len() as f64;
-
-    let avg_ttft_ms = stats
-        .iter()
-        .map(|s| s.ttft.as_secs_f64() * 1000.0)
-        .sum::<f64>()
-        / n;
-
-    let avg_decode_tok_s = stats
-        .iter()
-        .map(|s| {
-            if s.decode_time.is_zero() {
-                0.0
-            } else {
-                s.output_token_count as f64 / s.decode_time.as_secs_f64()
-            }
-        })
-        .sum::<f64>()
-        / n;
-
-    let avg_output_tokens = stats
-        .iter()
-        .map(|s| s.output_token_count as f64)
-        .sum::<f64>()
-        / n;
-
-    println!("  Model summary:");
-    println!("    • model: {model_name}");
-    println!("    • avg TTFT: {:.2} ms", avg_ttft_ms);
-    println!("    • avg decode throughput: {:.2} tok/s", avg_decode_tok_s);
-    println!("    • avg output tokens: {:.2}", avg_output_tokens);
+    config
 }
 
 fn main() {
-    let runtime = RuntimeConfig::from_env();
+    // ── Parse CLI arguments ─────────────────────────────────────────────
+    let cli = parse_cli();
+
+    // ── Handle --list-models early exit ──────────────────────────────────
+    // If the user just wants to see what models are available, print and quit.
+    #[cfg(feature = "candle")]
+    {
+        if cli.list_models {
+            candle_runner::inner::print_available_models();
+            return; // exit immediately, don't run benchmarks
+        }
+    }
+    #[cfg(not(feature = "candle"))]
+    {
+        if cli.list_models {
+            println!("\n  Model selection requires the 'candle' feature.");
+            println!("  Run with: cargo run --release --features candle -- --list-models\n");
+            return;
+        }
+    }
 
     println!("LLM Benchmarking Suite for Rust\n");
     println!(
@@ -102,12 +143,17 @@ fn main() {
 
     let model_configs = vec![("tiny", GptConfig::tiny()), ("small", GptConfig::small())];
 
-    let bench_config = BenchmarkConfig::default();
+    // Shared model sizes across sections
+    let model_configs = vec![
+        ("tiny", GptConfig::tiny()),
+        ("small", GptConfig::small()),
+    ];
 
-    // -------------------------------------------------------------------------
-    // Section 1 – Burn backend comparison
-    // -------------------------------------------------------------------------
-    if !runtime.section3_only {
+    // ──────────────────────────────────────────────────────────────────────────
+    // Section 1 – Burn backend comparison (forward-pass throughput)
+    // ──────────────────────────────────────────────────────────────────────────
+    let bench_config = BenchmarkConfig::default();
+    if !cli.section3_only {
         println!("{:=<80}", "");
         println!(" SECTION 1: Burn Backend Throughput (identical architecture, random weights)");
         println!("{:=<80}\n", "");
@@ -186,12 +232,18 @@ fn main() {
         compare_results(&burn_results);
     }
 
-    // -------------------------------------------------------------------------
-    // Section 2 – Candle pure-Rust LLM
-    // -------------------------------------------------------------------------
+    // ──────────────────────────────────────────────────────────────────────────
+    // Section 2 – Candle pure-Rust LLM (real GGUF model, real prompts)
+    //
+    // NEW: Instead of hardcoding TinyLlama, we look up the model from the
+    // registry based on what the user passed via --model or LLM_BENCH_MODEL.
+    // ──────────────────────────────────────────────────────────────────────────
     #[cfg(feature = "candle")]
     {
-        use candle_runner::inner::{CandleModelKind, CandleRunner};
+        if cli.section3_only {
+            // Skip Candle section if running training-only mode.
+        } else {
+        use candle_runner::inner::{CandleRunner, resolve_model, print_available_models};
 
         if !runtime.section3_only {
             println!("\n{:=<80}", "");
@@ -204,23 +256,52 @@ fn main() {
                  per-token latency p50/p95.\n"
             );
 
-            let models_to_run = if runtime.candle_model.eq_ignore_ascii_case("all") {
-                CandleModelKind::all()
-            } else {
-                match CandleModelKind::parse(&runtime.candle_model) {
-                    Some(m) => vec![m],
-                    None => {
-                        eprintln!(
-                            "Unknown Candle model '{}'. Supported values: tinyllama, llama32, phi4, qwen, all",
-                            runtime.candle_model
-                        );
-                        Vec::new()
-                    }
-                }
-            };
+        // ── Resolve which model to use ──────────────────────────────────
+        //
+        // Priority:
+        //   1. --model CLI arg  (already in cli.model_key)
+        //   2. LLM_BENCH_MODEL env var  (also already merged into cli.model_key)
+        //   3. Default to "tinyllama"
+        //
+        // If the user gave a key that doesn't match anything in the
+        // registry, we show the available models and bail out.
+        let model_key = cli.model_key
+            .as_deref()          // Option<String> → Option<&str>
+            .unwrap_or("tinyllama");  // default if nothing was specified
 
-            for kind in models_to_run {
-                let model_config = kind.config();
+        let model_config = match resolve_model(model_key) {
+            Some(config) => config,
+            None => {
+                // The user typed something we don't recognise.
+                // Show them what's available so they can fix it.
+                eprintln!(
+                    "  Error: unknown model key '{}'\n",
+                    model_key
+                );
+                print_available_models();
+                // Don't crash the whole program — just skip Section 2.
+                // Section 1 results (if any) are still useful.
+                eprintln!("  Skipping Section 2.\n");
+                return;
+            }
+        };
+
+        println!("  Selected model: {} (key: '{}')", model_config.display_name, model_key);
+        println!("  Loading model: {} …\n", model_config.display_name);
+
+        match CandleRunner::load(model_config) {
+            Err(e) => {
+                eprintln!(
+                    "  [Candle] Could not load model – skipping section 2.\n  Reason: {e}\n\
+                     Tip: ensure you have internet access for the first run (model is cached\n\
+                     afterwards). You can also set HF_TOKEN if the repo is gated.\n"
+                );
+            }
+            Ok(mut runner) => {
+                println!(
+                    "  Model loaded in {} ms (excluded from throughput numbers)\n",
+                    runner.model_load_time_ms
+                );
 
                 if model_config.requires_token && runtime.hf_token.is_none() {
                     eprintln!(
@@ -289,9 +370,9 @@ fn main() {
         );
     }
 
-    // -------------------------------------------------------------------------
-    // Section 3 – Training benchmark
-    // -------------------------------------------------------------------------
+    // ──────────────────────────────────────────────────────────────────────────
+    // Section 3 – Training benchmark with Burn TUI dashboard
+    // ──────────────────────────────────────────────────────────────────────────
     #[cfg(feature = "train")]
     {
         use burn::backend::Autodiff;
