@@ -9,40 +9,30 @@ use burn::{
     tensor::{backend::Backend, Int, Tensor},
 };
 
-/// Configuration for the GPT model
 #[derive(Config, Debug)]
 pub struct GptConfig {
-    /// Vocabulary size
     #[config(default = 1000)]
     pub vocab_size: usize,
-    
-    /// Hidden dimension
     #[config(default = 256)]
     pub hidden_size: usize,
     
-    /// Number of transformer layers
     #[config(default = 4)]
     pub num_layers: usize,
     
-    /// Number of attention heads
     #[config(default = 4)]
     pub num_heads: usize,
     
-    /// Maximum sequence length
     #[config(default = 128)]
     pub max_seq_len: usize,
     
-    /// Dropout probability
     #[config(default = 0.1)]
     pub dropout: f64,
     
-    /// Feed-forward intermediate size
     #[config(default = 1024)]
     pub intermediate_size: usize,
 }
 
 impl GptConfig {
-    /// Create a very small config for fast benchmarking
     pub fn tiny() -> Self {
         Self::new()
             .with_vocab_size(512)
@@ -53,7 +43,6 @@ impl GptConfig {
             .with_intermediate_size(256)
     }
 
-    /// Create a small config
     pub fn small() -> Self {
         Self::new()
             .with_vocab_size(2048)
@@ -65,7 +54,6 @@ impl GptConfig {
     }
 }
 
-/// GPT-style transformer model
 #[derive(Module, Debug)]
 pub struct Gpt<B: Backend> {
     token_embedding: Embedding<B>,
@@ -75,7 +63,6 @@ pub struct Gpt<B: Backend> {
     lm_head: Linear<B>,
     dropout: Dropout,
     max_seq_len: usize,
-    /// Stored for Display / summary only.
     hidden_size: usize,
 }
 
@@ -112,38 +99,31 @@ impl<B: Backend> Gpt<B> {
         }
     }
 
-    /// Forward pass through the model
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let [batch_size, seq_len] = input_ids.dims();
         assert!(seq_len <= self.max_seq_len, "Sequence length exceeds maximum");
         
-        // Create position indices [0, 1, 2, ..., seq_len-1]
         let positions = Tensor::arange(0..seq_len as i64, &input_ids.device())
             .reshape([1, seq_len])
             .repeat(&[batch_size, 1]);
         
-        // Token + position embeddings
         let token_emb = self.token_embedding.forward(input_ids);
         let pos_emb = self.position_embedding.forward(positions);
         
         let mut hidden = token_emb + pos_emb;
         hidden = self.dropout.forward(hidden);
         
-        // Pass through transformer layers
         for layer in &self.layers {
             hidden = layer.forward(hidden);
         }
         
-        // Final layer norm and LM head
         hidden = self.ln_final.forward(hidden);
         self.lm_head.forward(hidden)
     }
 
-    /// Generate logits for next token prediction
     pub fn generate_logits(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 2> {
         let logits = self.forward(input_ids);
         
-        // Get the logits for the last token in the sequence
         let [_batch_size, seq_len, _vocab_size] = logits.dims();
         logits
             .slice([0..1, (seq_len - 1)..seq_len])
@@ -151,10 +131,6 @@ impl<B: Backend> Gpt<B> {
     }
 }
 
-/// GPT-style transformer model with tied output projection using transpose.
-///
-/// Uses the token embedding matrix transposed as the LM head:
-/// logits = hidden * token_embedding.weight^T
 #[derive(Module, Debug)]
 pub struct GptTranspose<B: Backend> {
     token_embedding: Embedding<B>,
@@ -235,7 +211,6 @@ impl<B: Backend> GptTranspose<B> {
         logits_2d.reshape([b, s, self.vocab_size])
     }
 
-    /// Forward pass for inference/validation (no crash repro).
     pub fn forward_infer(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let hidden = self.forward_hidden(input_ids);
         self.logits_from_hidden(hidden)
@@ -251,7 +226,6 @@ impl<B: Backend> GptTranspose<B> {
     }
 }
 
-/// Single transformer block
 #[derive(Module, Debug)]
 pub struct TransformerBlock<B: Backend> {
     attention: MultiHeadAttention<B>,
@@ -282,21 +256,18 @@ impl<B: Backend> TransformerBlock<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        // Pre-norm architecture
-        // Self-attention with residual
+        
         let normed = self.ln1.forward(x.clone());
         let attn_input = MhaInput::self_attn(normed);
         let attn_out = self.attention.forward(attn_input);
         let x = x + self.dropout.forward(attn_out.context);
         
-        // MLP with residual
         let normed = self.ln2.forward(x.clone());
         let mlp_out = self.mlp.forward(normed);
         x + self.dropout.forward(mlp_out)
     }
 }
 
-/// Multi-layer perceptron (feed-forward network)
 #[derive(Module, Debug)]
 pub struct Mlp<B: Backend> {
     fc1: Linear<B>,
@@ -320,51 +291,3 @@ impl<B: Backend> Mlp<B> {
         self.fc2.forward(x)
     }
 }
-
-// #[derive(Debug, Clone)]
-// pub enum ModelChoice {
-//     TinyLlama,
-//     Phi4,
-//     Qwen2_5_0_5B,
-// }
-
-// pub struct ModelSpec {
-//     pub name: &'static str,
-//     pub repo_id: &'static str,
-//     pub revision: &'static str,
-//     pub default_dtype: &'static str,
-// }
-
-// impl ModelChoice {
-//     pub fn spec(&self) -> ModelSpec {
-//         match self {
-//             ModelChoice::TinyLlama => ModelSpec {
-//                 name: "tinyllama",
-//                 repo_id: "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-//                 revision: "main",
-//                 default_dtype: "f16",
-//             },
-//             ModelChoice::Phi4 => ModelSpec {
-//                 name: "phi4",
-//                 repo_id: "microsoft/phi-4",
-//                 revision: "main",
-//                 default_dtype: "bf16",
-//             },
-//             ModelChoice::Qwen2_5_0_5B => ModelSpec {
-//                 name: "qwen2.5-0.5b",
-//                 repo_id: "Qwen/Qwen2.5-0.5B-Instruct",
-//                 revision: "main",
-//                 default_dtype: "bf16",
-//             },
-//         }
-//     }
-
-//     pub fn parse(s: &str) -> Option<Self> {
-//         match s.to_lowercase().as_str() {
-//             "tinyllama" => Some(Self::TinyLlama),
-//             "phi4" | "phi-4" => Some(Self::Phi4),
-//             "qwen" | "qwen2.5" | "qwen2.5-0.5b" => Some(Self::Qwen2_5_0_5B),
-//             _ => None,
-//         }
-//     }
-// }

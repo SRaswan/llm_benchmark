@@ -1,25 +1,3 @@
-/// Training benchmark using Burn's `SupervisedTraining` and its built-in TUI dashboard.
-///
-/// What the TUI shows (live, while training runs):
-///   - Loss curve (train + validation) plotted in the terminal
-///   - Items/second (= training throughput, forward + backward + optimiser)
-///   - Epoch / step progress bars
-///   - Final summary table after `.fit()` returns
-///
-/// How it works:
-///   Burn wraps any backend with `Autodiff<B>` to enable gradient tracking.
-///   We create a random-token language-modelling dataset (same sizes as the
-///   inference benchmarks), implement `TrainStep` / `InferenceStep` for `Gpt`,
-///   and hand everything to `SupervisedTraining`.  The TUI is the **default**
-///   renderer – no extra configuration required.
-///
-/// Apples-to-apples vs inference (Section 1):
-///   - Same `GptConfig` (tiny / small)
-///   - Same batch size and sequence length
-///   - Same backends (NdArray-Autodiff, WGPU-Autodiff)
-///   - Random weights + random tokens → measures pure compute cost, not data loading
-///   - Model load time not included in tokens/sec (identical to Section 1 methodology)
-
 #[cfg(feature = "train")]
 pub mod inner {
     use std::fmt::Display;
@@ -44,20 +22,13 @@ pub mod inner {
 
     use crate::model::{Gpt, GptConfig, GptTranspose};
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // Dataset – random token sequences
-    // ══════════════════════════════════════════════════════════════════════════
-
-    /// A single language-modelling example: input tokens and next-token targets.
+    
     #[derive(Clone, Debug)]
     pub struct LMItem {
-        /// Token IDs for positions 0..seq_len
         pub input_ids: Vec<i32>,
-        /// Token IDs for positions 1..seq_len+1 (next-token targets)
         pub target_ids: Vec<i32>,
     }
 
-    /// In-memory dataset of randomly generated token sequences.
     pub struct RandomLMDataset {
         items: Vec<LMItem>,
     }
@@ -91,14 +62,10 @@ pub mod inner {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // Batcher – stacks individual items into a batched tensor struct
-    // ══════════════════════════════════════════════════════════════════════════
-
     #[derive(Clone, Debug)]
     pub struct LMBatch<B: Backend> {
-        pub input_ids: Tensor<B, 2, Int>,   // [batch, seq]
-        pub target_ids: Tensor<B, 2, Int>,  // [batch, seq]
+        pub input_ids: Tensor<B, 2, Int>,   
+        pub target_ids: Tensor<B, 2, Int>,  
     }
 
     #[derive(Clone)]
@@ -142,17 +109,13 @@ pub mod inner {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // Training / validation steps
-    // ══════════════════════════════════════════════════════════════════════════
-
+    
     impl<B: AutodiffBackend> TrainStep for Gpt<B> {
         type Input = LMBatch<B>;
         type Output = ClassificationOutput<B>;
 
         fn step(&self, batch: Self::Input) -> TrainOutput<Self::Output> {
             let output = lm_forward(self, batch);
-            // `loss` is inside `output`; clone it for backward before moving into output
             let grads = output.loss.backward();
             TrainOutput::new(self, grads, output)
         }
@@ -173,7 +136,6 @@ pub mod inner {
 
         fn step(&self, batch: Self::Input) -> TrainOutput<Self::Output> {
             let output = lm_forward_transpose_train(self, batch);
-            // `loss` is inside `output`; clone it for backward before moving into output
             let aux_loss = transpose_repro_loss::<B>(output.output.clone());
             let loss = output.loss.clone() + aux_loss * 0.0001;
             let grads = loss.backward();
@@ -190,18 +152,15 @@ pub mod inner {
         }
     }
 
-    /// Shared forward + loss computation used by both train and valid steps.
     fn lm_forward<B: Backend>(
         model: &Gpt<B>,
         batch: LMBatch<B>,
     ) -> ClassificationOutput<B> {
         let [batch_size, seq_len] = batch.input_ids.dims();
-        let logits = model.forward(batch.input_ids); // [batch, seq, vocab]
+        let logits = model.forward(batch.input_ids); 
         let vocab = logits.dims()[2];
 
-        // Flatten to [batch*seq, vocab] for cross-entropy
         let logits_flat = logits.reshape([batch_size * seq_len, vocab]);
-        // Flatten targets to [batch*seq]
         let targets_flat = batch.target_ids.reshape([batch_size * seq_len]);
 
         let loss = CrossEntropyLossConfig::new()
@@ -211,18 +170,15 @@ pub mod inner {
         ClassificationOutput::new(loss, logits_flat, targets_flat)
     }
 
-    /// Shared forward + loss computation used by both train and valid steps.
     fn lm_forward_transpose<B: Backend>(
         model: &GptTranspose<B>,
         batch: LMBatch<B>,
     ) -> ClassificationOutput<B> {
         let [batch_size, seq_len] = batch.input_ids.dims();
-        let logits = model.forward_infer(batch.input_ids); // [batch, seq, vocab]
+        let logits = model.forward_infer(batch.input_ids); 
         let vocab = logits.dims()[2];
 
-        // Flatten to [batch*seq, vocab] for cross-entropy
         let logits_flat = logits.reshape([batch_size * seq_len, vocab]);
-        // Flatten targets to [batch*seq]
         let targets_flat = batch.target_ids.reshape([batch_size * seq_len]);
 
         let loss = CrossEntropyLossConfig::new()
@@ -232,18 +188,15 @@ pub mod inner {
         ClassificationOutput::new(loss, logits_flat, targets_flat)
     }
 
-    /// Training-only forward (repro is injected just before backward in TrainStep).
     fn lm_forward_transpose_train<B: AutodiffBackend>(
         model: &GptTranspose<B>,
         batch: LMBatch<B>,
     ) -> ClassificationOutput<B> {
         let [batch_size, seq_len] = batch.input_ids.dims();
-        let logits = model.forward_infer(batch.input_ids); // [batch, seq, vocab]
+        let logits = model.forward_infer(batch.input_ids); 
         let vocab = logits.dims()[2];
 
-        // Flatten to [batch*seq, vocab] for cross-entropy
         let logits_flat = logits.reshape([batch_size * seq_len, vocab]);
-        // Flatten targets to [batch*seq]
         let targets_flat = batch.target_ids.reshape([batch_size * seq_len]);
 
         let loss = CrossEntropyLossConfig::new()
@@ -254,27 +207,13 @@ pub mod inner {
     }
 
     fn transpose_repro_loss<B: AutodiffBackend>(logits_flat: Tensor<B, 2>) -> Tensor<B, 1> {
-        // Decorrelation/energy regularizer on logits (legit auxiliary signal),
-        // while still mimicking the transpose/add pattern from example_fail.rs.
-        // Build a square Gram matrix so transpose/add matches shapes.
         let t0 = logits_flat.clone().transpose().matmul(logits_flat);
         let t1 = t0.clone().transpose();
         let t2 = t1.clone() + t0.clone();
-        // Penalize large correlations (L2 on Gram matrix).
         (t2.clone() * t2).mean()
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    // Public entry point
-    // ══════════════════════════════════════════════════════════════════════════
-
-    /// Run the training benchmark with the Burn TUI dashboard.
-    ///
-    /// The TUI dashboard launches in-place in the terminal and shows:
-    ///  - Live loss curve (train + validation)
-    ///  - Training throughput (items/sec = sequences/sec)
-    ///  - Epoch / step progress bars
-    ///  - Summary table at the end
+    
     pub fn run_training_benchmark<B, M, F>(
         config: &GptConfig,
         device: B::Device,
@@ -301,11 +240,9 @@ pub mod inner {
             config.max_seq_len,
         );
 
-        // ── Data ──────────────────────────────────────────────────────────────
         let seq_len = config.max_seq_len;
         let vocab_size = config.vocab_size;
-        // 256 training items, 64 validation items – enough to fill several epochs
-        // without the benchmark taking too long.
+        
         let train_ds = RandomLMDataset::new(256, seq_len, vocab_size);
         let valid_ds = RandomLMDataset::new(64, seq_len, vocab_size);
         let train_steps = steps_per_epoch(train_ds.len(), batch_size);
@@ -326,32 +263,25 @@ pub mod inner {
             .num_workers(1)
             .build(valid_ds);
 
-        // ── Model + optimiser ─────────────────────────────────────────────────
         let model = build_model(config, &device);
         let optimizer_cfg = AdamConfig::new();
         let optimizer = optimizer_cfg.init::<B, M>();
         let lr_scheduler = ConstantLr::new(1e-4_f64);
         let learner = Learner::new(model, optimizer, lr_scheduler);
 
-        // ── SupervisedTraining – TUI dashboard is the default renderer ────────
-        // Checkpoints are written to /tmp/llm_benchmark_train/<backend>/
         let artifact_dir = format!(
             "/tmp/llm_benchmark_train/{}",
             backend_name.replace(' ', "_")
         );
 
         let training = SupervisedTraining::new(&artifact_dir, train_loader, valid_loader)
-            // Loss shown as a numeric chart in the TUI
             .metric_train_numeric(LossMetric::<burn_ndarray::NdArray>::new())
             .metric_valid_numeric(LossMetric::<burn_ndarray::NdArray>::new())
-            // Optional file checkpointing (comment out to skip disk writes)
             .with_file_checkpointer(CompactRecorder::new())
             .num_epochs(num_epochs)
-            // Print a textual summary table after .fit() returns
             .summary()
             .with_training_strategy(burn::train::TrainingStrategy::SingleDevice(device.clone()));
 
-        // ── Train – the TUI dashboard appears here ────────────────────────────
         let start = Instant::now();
         let _trained_model = training.launch(learner);
         let total_time = start.elapsed();
@@ -391,9 +321,9 @@ pub mod inner {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5);
         let kernels_per_layer: u64 = 12;
-        let base_kernels: u64 = 3; // embeddings + final ln + lm head
+        let base_kernels: u64 = 3; 
         let forward_kernels = base_kernels + kernels_per_layer * config.num_layers as u64;
-        let train_kernels = forward_kernels * 3; // forward + backward + optimizer (rough)
+        let train_kernels = forward_kernels * 3; 
         (train_kernels, train_kernels * per_kernel_us)
     }
 
@@ -412,11 +342,11 @@ pub mod inner {
         let v = config.vocab_size as u64;
 
         let bytes_hidden = b * s * h * 4;
-        let bytes_per_layer = bytes_hidden * 2; // read + write
+        let bytes_per_layer = bytes_hidden * 2; 
         let bytes_logits = b * s * v * 4;
         let forward_bytes =
             bytes_hidden + bytes_per_layer * config.num_layers as u64 + bytes_logits;
-        let train_bytes = forward_bytes * 3; // forward + backward + optimizer (rough)
+        let train_bytes = forward_bytes * 3; 
 
         train_bytes as f64 / avg_step_time.as_secs_f64() / 1e9
     }

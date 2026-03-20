@@ -17,40 +17,10 @@ use burn_tch::{LibTorch, LibTorchDevice};
 use model::{Gpt, GptConfig};
 use prompts::{BENCHMARK_PROMPTS, WARMUP_PROMPT};
 
-// ══════════════════════════════════════════════════════════════════════════════
-// CLI ARGUMENT PARSING
-//
-// We're not pulling in a full CLI library like `clap` — that would be overkill
-// for the few flags we need, and it keeps the dependency list small.  Instead
-// we do a simple manual parse of std::env::args().
-//
-// Supported arguments:
-//   --model <key>     Pick which HuggingFace model to use for Section 2.
-//                     Keys: tinyllama, phi3, llama3-1b, llama3-3b
-//                     Default: tinyllama
-//
-//   --list-models     Print available models and exit.
-//
-// The model key can also be set via env var:
-//   LLM_BENCH_MODEL=phi3 cargo run --release --features candle
-//
-// Precedence: CLI arg > env var > default (tinyllama).
-// ══════════════════════════════════════════════════════════════════════════════
 
-/// Holds the parsed CLI configuration.
-///
-/// Right now this only has model selection, but it's a struct so we can
-/// easily add more flags later (e.g. --quick, --thorough, --batch-size)
-/// without changing the function signature everywhere.
 struct CliConfig {
-    /// Which model key the user picked (e.g. "tinyllama", "phi3").
-    /// None means "use default" (tinyllama).
     model_key: Option<String>,
-
-    /// If true, just print available models and exit.
     list_models: bool,
-
-    /// If true, only run section 3 (training).
     section3_only: bool,
 }
 
@@ -80,53 +50,42 @@ impl RuntimeConfig {
     }
 }
 
-/// Parse command-line arguments into a CliConfig.
-///
-/// This is intentionally simple — just iterates through args looking for
-/// known flags.  Unknown args are ignored (Cargo sometimes passes its own).
+
 fn parse_cli() -> CliConfig {
     let args: Vec<String> = std::env::args().collect();
 
     let mut config = CliConfig {
         model_key: None,
         list_models: false,
-        // Check the env var that was already used in the original code
         section3_only: std::env::var("LLM_BENCH_SECTION3_ONLY")
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false),
     };
 
-    // Walk through args looking for our flags.
-    // We start at index 1 to skip the program name (args[0]).
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            // --model <key>
-            // The next argument after --model is the model key string.
+            
             "--model" => {
-                // Make sure there's actually a value after --model
                 if i + 1 < args.len() {
                     config.model_key = Some(args[i + 1].clone());
-                    i += 2; // skip both --model and the key
+                    i += 2; 
                 } else {
                     eprintln!("Error: --model requires a value (e.g. --model tinyllama)");
                     std::process::exit(1);
                 }
             }
-            // --list-models: print the model table and exit
             "--list-models" => {
                 config.list_models = true;
                 i += 1;
             }
-            // Anything else: ignore (could be cargo args, etc.)
             _ => {
                 i += 1;
             }
         }
     }
 
-    // Also check env var as a fallback for model selection.
-    // CLI arg takes priority if both are set.
+    
     if config.model_key.is_none() {
         config.model_key = std::env::var("LLM_BENCH_MODEL").ok();
     }
@@ -135,17 +94,14 @@ fn parse_cli() -> CliConfig {
 }
 
 fn main() {
-    // ── Parse CLI arguments ─────────────────────────────────────────────
     let cli = parse_cli();
     let runtime = RuntimeConfig::from_cli(&cli);
 
-    // ── Handle --list-models early exit ──────────────────────────────────
-    // If the user just wants to see what models are available, print and quit.
     #[cfg(feature = "candle")]
     {
         if cli.list_models {
             candle_runner::inner::print_available_models();
-            return; // exit immediately, don't run benchmarks
+            return; 
         }
     }
     #[cfg(not(feature = "candle"))]
@@ -170,15 +126,12 @@ fn main() {
 
     let model_configs = vec![("tiny", GptConfig::tiny()), ("small", GptConfig::small())];
 
-    // Shared model sizes across sections
     let model_configs = vec![
         ("tiny", GptConfig::tiny()),
         ("small", GptConfig::small()),
     ];
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Section 1 – Burn backend comparison (forward-pass throughput)
-    // ──────────────────────────────────────────────────────────────────────────
+    
     let bench_config = BenchmarkConfig::default();
     if !cli.section3_only {
         println!("{:=<80}", "");
@@ -259,12 +212,6 @@ fn main() {
         compare_results(&burn_results);
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Section 2 – Candle pure-Rust LLM (real GGUF model, real prompts)
-    //
-    // NEW: Instead of hardcoding TinyLlama, we look up the model from the
-    // registry based on what the user passed via --model or LLM_BENCH_MODEL.
-    // ──────────────────────────────────────────────────────────────────────────
     #[cfg(feature = "candle")]
     {
         if !cli.section3_only {
@@ -280,29 +227,17 @@ fn main() {
                  per-token latency p50/p95.\n"
             );
 
-            // ── Resolve which model to use ──────────────────────────────────
-            //
-            // Priority:
-            //   1. --model CLI arg  (already in cli.model_key)
-            //   2. LLM_BENCH_MODEL env var  (also already merged into cli.model_key)
-            //   3. Default to "tinyllama"
-            //
-            // If the user gave a key that doesn't match anything in the
-            // registry, we show the available models and bail out.
             let model_key = cli
                 .model_key
-                .as_deref() // Option<String> → Option<&str>
-                .unwrap_or("tinyllama"); // default if nothing was specified
+                .as_deref() 
+                .unwrap_or("tinyllama"); 
 
             let model_config = match resolve_model(model_key) {
                 Some(config) => Some(config),
                 None => {
-                    // The user typed something we don't recognise.
-                    // Show them what's available so they can fix it.
+                    
                     eprintln!("  Error: unknown model key '{}'\n", model_key);
                     print_available_models();
-                    // Don't crash the whole program — just skip Section 2.
-                    // Section 1 results (if any) are still useful.
                     eprintln!("  Skipping Section 2.\n");
                     None
                 }
@@ -381,9 +316,6 @@ fn main() {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Section 3 – Training benchmark with Burn TUI dashboard
-    // ──────────────────────────────────────────────────────────────────────────
     #[cfg(feature = "train")]
     {
         use burn::backend::Autodiff;
@@ -417,7 +349,6 @@ fn main() {
             println!("{:->60}", "");
 
             if train_transpose_only {
-                // LibTorch + Autodiff (CPU) - transpose GPT (run first)
                 #[cfg(feature = "tch")]
                 run_training_benchmark::<Autodiff<LibTorch<f32>>, model::GptTranspose<Autodiff<LibTorch<f32>>>, _>(
                     gpt_config,
@@ -429,7 +360,6 @@ fn main() {
                     model::GptTranspose::<Autodiff<LibTorch<f32>>>::new,
                 );
 
-                // NdArray + Autodiff (CPU) - transpose GPT
                 run_training_benchmark::<Autodiff<NdArray>, model::GptTranspose<Autodiff<NdArray>>, _>(
                     gpt_config,
                     NdArrayDevice::Cpu,
@@ -440,7 +370,6 @@ fn main() {
                     model::GptTranspose::<Autodiff<NdArray>>::new,
                 );
 
-                // WGPU + Autodiff (GPU) - transpose GPT
                 run_training_benchmark::<Autodiff<Wgpu>, model::GptTranspose<Autodiff<Wgpu>>, _>(
                     gpt_config,
                     WgpuDevice::default(),
@@ -451,7 +380,6 @@ fn main() {
                     model::GptTranspose::<Autodiff<Wgpu>>::new,
                 );
             } else {
-                // LibTorch + Autodiff (CPU) - standard GPT (run first)
                 #[cfg(feature = "tch")]
                 run_training_benchmark::<Autodiff<LibTorch<f32>>, Gpt<Autodiff<LibTorch<f32>>>, _>(
                     gpt_config,
@@ -463,7 +391,6 @@ fn main() {
                     Gpt::<Autodiff<LibTorch<f32>>>::new,
                 );
 
-                // NdArray + Autodiff (CPU) - standard GPT
                 run_training_benchmark::<Autodiff<NdArray>, Gpt<Autodiff<NdArray>>, _>(
                     gpt_config,
                     NdArrayDevice::Cpu,
@@ -474,7 +401,6 @@ fn main() {
                     Gpt::<Autodiff<NdArray>>::new,
                 );
 
-                // WGPU + Autodiff (GPU)
                 run_training_benchmark::<Autodiff<Wgpu>, Gpt<Autodiff<Wgpu>>, _>(
                     gpt_config,
                     WgpuDevice::default(),

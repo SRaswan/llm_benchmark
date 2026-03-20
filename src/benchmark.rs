@@ -5,24 +5,14 @@ use sys_info::mem_info;
 
 use crate::model::{Gpt, GptConfig};
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Memory measurement utilities
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Memory usage statistics in bytes
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryStats {
-    /// Resident Set Size (RSS) - physical memory used
     pub rss_bytes: u64,
-    /// Virtual memory size
     pub vsz_bytes: u64,
 }
 
 impl MemoryStats {
-    /// Get current memory usage of the process
     pub fn current() -> Result<Self, Box<dyn std::error::Error>> {
-        // Read /proc/self/statm for process memory info
-        // Format: size resident shared text lib data dt
         let statm = std::fs::read_to_string("/proc/self/statm")?;
         let parts: Vec<&str> = statm.trim().split_whitespace().collect();
         
@@ -30,7 +20,6 @@ impl MemoryStats {
             return Err("Invalid /proc/self/statm format".into());
         }
         
-        // Values are in pages (typically 4KB)
         let page_size = 4096u64;
         let rss_pages: u64 = parts[1].parse()?;
         let vsz_pages: u64 = parts[0].parse()?;
@@ -41,18 +30,15 @@ impl MemoryStats {
         })
     }
 
-    /// Memory usage in MB
     pub fn rss_mb(&self) -> f64 {
         self.rss_bytes as f64 / (1024.0 * 1024.0)
     }
 
-    /// Memory usage in GB
     pub fn rss_gb(&self) -> f64 {
         self.rss_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     }
 }
 
-/// Measure memory usage change during a function execution
 pub fn measure_memory_usage<F, T>(f: F) -> Result<(T, MemoryStats), Box<dyn std::error::Error>>
 where
     F: FnOnce() -> T,
@@ -69,38 +55,17 @@ where
     Ok((result, peak_memory))
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Generation-level statistics (used by Candle + any autoregressive runner)
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// Detailed stats for a single prompt-completion run.
-///
-/// # Key metrics glossary
-/// | Metric | What it measures |
-/// |--------|-----------------|
-/// | `ttft_ms` | **Time To First Token** – how long until the 1st output token appears. Dominated by attention over the input prompt (prefill). |
-/// | `output_tokens_per_sec` | **Decode throughput** – output tokens generated per wall-clock second *after* the first token. The primary apples-to-apples number. |
-/// | `p50_latency_us` / `p95_latency_us` | Per-token **latency percentiles** – how long each decode step takes. |
-/// | `total_time_ms` | End-to-end time including prefill + all decode steps. |
 #[derive(Debug, Clone)]
 pub struct GenerationStats {
     pub prompt_name: String,
     pub backend_name: String,
-    /// Number of tokens in the input prompt (prefill tokens).
     pub prompt_token_count: usize,
-    /// Number of tokens actually generated (output tokens).
     pub output_token_count: usize,
-    /// Time to first token (prefill latency).
     pub ttft: Duration,
-    /// Total time spent in the decode loop (all steps after prefill).
     pub decode_time: Duration,
-    /// Raw per-step latencies in microseconds (one entry per output token).
     pub per_token_latencies_us: Vec<u64>,
-    /// Median per-token latency.
     pub p50_latency_us: u64,
-    /// 95th-percentile per-token latency.
     pub p95_latency_us: u64,
-    /// Peak memory usage during generation
     pub peak_memory: MemoryStats,
 }
 
@@ -128,7 +93,6 @@ impl GenerationStats {
         }
     }
 
-    /// Output tokens generated per second (decode phase only).
     pub fn output_tokens_per_sec(&self) -> f64 {
         if self.decode_time.is_zero() || self.output_token_count == 0 {
             return 0.0;
@@ -136,13 +100,10 @@ impl GenerationStats {
         self.output_token_count as f64 / self.decode_time.as_secs_f64()
     }
 
-    /// Total wall-clock time (prefill + decode).
     pub fn total_time(&self) -> Duration {
         self.ttft + self.decode_time
     }
 
-    /// Recompute p50 / p95 from `per_token_latencies_us`. Call after
-    /// populating that field.
     pub fn compute_percentiles(&mut self) {
         if self.per_token_latencies_us.is_empty() {
             return;
@@ -197,7 +158,6 @@ impl GenerationStats {
     }
 }
 
-/// Print a side-by-side comparison table for multiple `GenerationStats`.
 pub fn compare_generation_results(results: &[GenerationStats]) {
     if results.is_empty() {
         return;
@@ -225,7 +185,6 @@ pub fn compare_generation_results(results: &[GenerationStats]) {
     }
     println!("╚══════════════════════════════════════════════════════════════════════════════════════════════╝");
 
-    // Find fastest decode throughput
     if let Some(fastest) = results.iter().max_by(|a, b| {
         a.output_tokens_per_sec()
             .partial_cmp(&b.output_tokens_per_sec())
@@ -248,7 +207,6 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Statistics from a benchmark run
 #[derive(Debug, Clone)]
 pub struct BenchmarkStats {
     pub backend_name: String,
@@ -259,19 +217,12 @@ pub struct BenchmarkStats {
     pub total_time: Duration,
     pub avg_time_per_iteration: Duration,
     pub tokens_per_second: f64,
-    /// Raw per-iteration latencies in microseconds.
     pub per_iter_latencies_us: Vec<u64>,
-    /// Median per-iteration latency.
     pub p50_latency_us: u64,
-    /// 95th-percentile per-iteration latency.
     pub p95_latency_us: u64,
-    /// Estimated kernel count per iteration (rough heuristic).
     pub estimated_kernels: u64,
-    /// Estimated kernel launch overhead per iteration (microseconds).
     pub estimated_kernel_launch_us: u64,
-    /// Estimated memory bandwidth in GB/s (rough heuristic).
     pub estimated_bandwidth_gbps: f64,
-    /// Peak memory usage during benchmark
     pub peak_memory: MemoryStats,
 }
 
@@ -327,7 +278,6 @@ impl BenchmarkStats {
     }
 }
 
-/// Run benchmark for a specific backend
 pub fn benchmark_model<B: Backend>(
     model: &Gpt<B>,
     config: &GptConfig,
@@ -346,14 +296,12 @@ pub fn benchmark_model<B: Backend>(
     let input_shape = [batch_size, seq_len];
     let numel = batch_size * seq_len;
     
-    // Warmup run
     println!("  Warming up...");
     for _ in 0..3 {
         let input = random_input::<B>(numel, input_shape, device);
         let _ = model.forward(input);
     }
 
-    // Actual benchmark
     println!("  Benchmarking...");
     let start = Instant::now();
     
@@ -375,7 +323,7 @@ pub fn benchmark_model<B: Backend>(
         ((), MemoryStats { rss_bytes: 0, vsz_bytes: 0 })
     });
     
-    println!(); // New line after progress dots
+    println!(); 
     let total_time = start.elapsed();
     let avg_time = total_time / num_iterations as u32;
     
@@ -424,7 +372,7 @@ fn estimate_kernel_launch_overhead(config: &GptConfig) -> (u64, u64) {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(5);
     let kernels_per_layer: u64 = 12;
-    let base_kernels: u64 = 3; // embeddings + final ln + lm head
+    let base_kernels: u64 = 3; 
     let total_kernels = base_kernels + kernels_per_layer * config.num_layers as u64;
     (total_kernels, total_kernels * per_kernel_us)
 }
@@ -443,9 +391,8 @@ fn estimate_bandwidth_gbps(
     let h = config.hidden_size as u64;
     let v = config.vocab_size as u64;
 
-    // Rough activation traffic (bytes), assuming f32 activations.
     let bytes_hidden = b * s * h * 4;
-    let bytes_per_layer = bytes_hidden * 2; // read + write
+    let bytes_per_layer = bytes_hidden * 2; 
     let bytes_logits = b * s * v * 4;
     let total_bytes = bytes_hidden + bytes_per_layer * config.num_layers as u64 + bytes_logits;
 
@@ -462,7 +409,6 @@ fn random_input<B: Backend>(
     Tensor::<B, 2, Int>::from_data(TensorData::new(data, shape), device)
 }
 
-/// Compare multiple benchmark results
 pub fn compare_results(results: &[BenchmarkStats]) {
     if results.is_empty() {
         return;
@@ -490,7 +436,6 @@ pub fn compare_results(results: &[BenchmarkStats]) {
 
     println!("╚═══════════════════════════════════════════════════════════════════════════════╝");
 
-    // Find fastest
     if let Some(fastest) = results.iter().max_by(|a, b| {
         a.tokens_per_second
             .partial_cmp(&b.tokens_per_second)
@@ -503,7 +448,6 @@ pub fn compare_results(results: &[BenchmarkStats]) {
     }
 }
 
-/// Benchmark configuration
 pub struct BenchmarkConfig {
     pub batch_size: usize,
     pub sequence_length: usize,
