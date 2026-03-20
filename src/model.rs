@@ -145,7 +145,7 @@ impl<B: Backend> Gpt<B> {
         
         // Get the logits for the last token in the sequence
         let [_batch_size, seq_len, _vocab_size] = logits.dims();
-        logits.slice([0..1, (seq_len - 1)..seq_len]).squeeze(1)
+        logits.slice([0..1, (seq_len - 1)..seq_len]).squeeze()
     }
 }
 
