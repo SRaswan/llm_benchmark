@@ -1,6 +1,3 @@
-// benches/llm_benchmark.rs
-// Basic benchmark scaffold for llm_benchmark
-
 #![feature(test)]
 extern crate test;
 
@@ -12,7 +9,6 @@ mod benches {
     #[bench]
     fn bench_example(b: &mut Bencher) {
         b.iter(|| {
-            // Place code to benchmark here
             let x = 2 + 2;
             test::black_box(x);
         });

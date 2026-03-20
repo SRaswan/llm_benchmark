@@ -12,90 +12,75 @@ use burn_tch::{LibTorch, LibTorchDevice};
 use model::{Gpt, GptConfig};
 use prompts::{BENCHMARK_PROMPTS, WARMUP_PROMPT};
 
-// ══════════════════════════════════════════════════════════════════════════════
-// CLI ARGUMENT PARSING
-//
-// We're not pulling in a full CLI library like `clap` — that would be overkill
-// for the few flags we need, and it keeps the dependency list small.  Instead
-// we do a simple manual parse of std::env::args().
-//
-// Supported arguments:
-//   --model <key>     Pick which HuggingFace model to use for Section 2.
-//                     Keys: tinyllama, phi3, llama3-1b, llama3-3b
-//                     Default: tinyllama
-//
-//   --list-models     Print available models and exit.
-//
-// The model key can also be set via env var:
-//   LLM_BENCH_MODEL=phi3 cargo run --release --features candle
-//
-// Precedence: CLI arg > env var > default (tinyllama).
-// ══════════════════════════════════════════════════════════════════════════════
 
-/// Holds the parsed CLI configuration.
-///
-/// Right now this only has model selection, but it's a struct so we can
-/// easily add more flags later (e.g. --quick, --thorough, --batch-size)
-/// without changing the function signature everywhere.
 struct CliConfig {
-    /// Which model key the user picked (e.g. "tinyllama", "phi3").
-    /// None means "use default" (tinyllama).
     model_key: Option<String>,
-
-    /// If true, just print available models and exit.
     list_models: bool,
-
-    /// If true, only run section 3 (training).
     section3_only: bool,
 }
 
-/// Parse command-line arguments into a CliConfig.
-///
-/// This is intentionally simple — just iterates through args looking for
-/// known flags.  Unknown args are ignored (Cargo sometimes passes its own).
+struct RuntimeConfig {
+    section3_only: bool,
+    candle_model: String,
+    hf_token: Option<String>,
+}
+
+impl RuntimeConfig {
+    fn from_cli(cli: &CliConfig) -> Self {
+        let hf_token = std::env::var("LLM_BENCH_HF_TOKEN")
+            .or_else(|_| std::env::var("HF_TOKEN"))
+            .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
+            .ok();
+
+        let candle_model = cli
+            .model_key
+            .clone()
+            .unwrap_or_else(|| "tinyllama".to_string());
+
+        Self {
+            section3_only: cli.section3_only,
+            candle_model,
+            hf_token,
+        }
+    }
+}
+
+
 fn parse_cli() -> CliConfig {
     let args: Vec<String> = std::env::args().collect();
 
     let mut config = CliConfig {
         model_key: None,
         list_models: false,
-        // Check the env var that was already used in the original code
         section3_only: std::env::var("LLM_BENCH_SECTION3_ONLY")
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false),
     };
 
-    // Walk through args looking for our flags.
-    // We start at index 1 to skip the program name (args[0]).
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            // --model <key>
-            // The next argument after --model is the model key string.
+            
             "--model" => {
-                // Make sure there's actually a value after --model
                 if i + 1 < args.len() {
                     config.model_key = Some(args[i + 1].clone());
-                    i += 2; // skip both --model and the key
+                    i += 2; 
                 } else {
                     eprintln!("Error: --model requires a value (e.g. --model tinyllama)");
                     std::process::exit(1);
                 }
             }
-            // --list-models: print the model table and exit
             "--list-models" => {
                 config.list_models = true;
                 i += 1;
             }
-            // Anything else: ignore (could be cargo args, etc.)
             _ => {
                 i += 1;
             }
         }
     }
 
-    // Also check env var as a fallback for model selection.
-    // CLI arg takes priority if both are set.
+    
     if config.model_key.is_none() {
         config.model_key = std::env::var("LLM_BENCH_MODEL").ok();
     }
@@ -104,16 +89,14 @@ fn parse_cli() -> CliConfig {
 }
 
 fn main() {
-    // ── Parse CLI arguments ─────────────────────────────────────────────
     let cli = parse_cli();
+    let runtime = RuntimeConfig::from_cli(&cli);
 
-    // ── Handle --list-models early exit ──────────────────────────────────
-    // If the user just wants to see what models are available, print and quit.
     #[cfg(feature = "candle")]
     {
         if cli.list_models {
             candle_runner::inner::print_available_models();
-            return; // exit immediately, don't run benchmarks
+            return; 
         }
     }
     #[cfg(not(feature = "candle"))]
@@ -134,16 +117,14 @@ fn main() {
             autoregressive generation on real prompts with the same metrics.\n"
     );
     print_system_info();
+    print_runtime_info(&runtime);
 
-    // Shared model sizes across sections
     let model_configs = vec![
         ("tiny", GptConfig::tiny()),
         ("small", GptConfig::small()),
     ];
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Section 1 – Burn backend comparison (forward-pass throughput)
-    // ──────────────────────────────────────────────────────────────────────────
+    
     let bench_config = BenchmarkConfig::default();
     if !cli.section3_only {
         println!("{:=<80}", "");
@@ -223,75 +204,51 @@ fn main() {
         compare_results(&burn_results);
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Section 2 – Candle pure-Rust LLM (real GGUF model, real prompts)
-    //
-    // NEW: Instead of hardcoding TinyLlama, we look up the model from the
-    // registry based on what the user passed via --model or LLM_BENCH_MODEL.
-    // ──────────────────────────────────────────────────────────────────────────
     #[cfg(feature = "candle")]
     {
-        if cli.section3_only {
-            // Skip Candle section if running training-only mode.
-        } else {
-        use candle_runner::inner::{CandleRunner, resolve_model, print_available_models};
+        if !cli.section3_only {
+            use candle_runner::inner::{print_available_models, resolve_model, CandleRunner};
 
-        println!("\n{:=<80}", "");
-        println!(" SECTION 2: Candle Pure-Rust LLM (real weights, real prompts)");
-        println!("{:=<80}\n", "");
-        println!(
-            "Apples-to-apples: same GGUF file, same prompts, same max_new_tokens,\n\
-             greedy decoding (temperature=0). Model load time is excluded.\n\
-             Metrics: TTFT (prefill latency), output tokens/sec (decode throughput),\n\
-             per-token latency p50/p95.\n"
-        );
+            println!("\n{:=<80}", "");
+            println!(" SECTION 2: Candle Pure-Rust LLM (real weights, real prompts)");
+            println!("{:=<80}\n", "");
+            println!(
+                "Apples-to-apples: same prompts, same max_new_tokens,\n\
+                 greedy decoding (temperature=0). Model load time is excluded.\n\
+                 Metrics: TTFT (prefill latency), output tokens/sec (decode throughput),\n\
+                 per-token latency p50/p95.\n"
+            );
 
-        // ── Resolve which model to use ──────────────────────────────────
-        //
-        // Priority:
-        //   1. --model CLI arg  (already in cli.model_key)
-        //   2. LLM_BENCH_MODEL env var  (also already merged into cli.model_key)
-        //   3. Default to "tinyllama"
-        //
-        // If the user gave a key that doesn't match anything in the
-        // registry, we show the available models and bail out.
-        let model_key = cli.model_key
-            .as_deref()          // Option<String> → Option<&str>
-            .unwrap_or("tinyllama");  // default if nothing was specified
+            let model_key = cli
+                .model_key
+                .as_deref() 
+                .unwrap_or("tinyllama"); 
 
-        let model_config = match resolve_model(model_key) {
-            Some(config) => config,
-            None => {
-                // The user typed something we don't recognise.
-                // Show them what's available so they can fix it.
-                eprintln!(
-                    "  Error: unknown model key '{}'\n",
-                    model_key
-                );
-                print_available_models();
-                // Don't crash the whole program — just skip Section 2.
-                // Section 1 results (if any) are still useful.
-                eprintln!("  Skipping Section 2.\n");
-                return;
-            }
-        };
+            let model_config = match resolve_model(model_key) {
+                Some(config) => Some(config),
+                None => {
+                    
+                    eprintln!("  Error: unknown model key '{}'\n", model_key);
+                    print_available_models();
+                    eprintln!("  Skipping Section 2.\n");
+                    None
+                }
+            };
 
-        println!("  Selected model: {} (key: '{}')", model_config.display_name, model_key);
-        println!("  Loading model: {} …\n", model_config.display_name);
+            if let Some(model_config) = model_config {
+                if let Some(token) = runtime.hf_token.as_deref() {
+                    if std::env::var("HF_TOKEN").is_err()
+                        && std::env::var("HUGGING_FACE_HUB_TOKEN").is_err()
+                    {
+                        std::env::set_var("HF_TOKEN", token);
+                    }
+                }
 
-        match CandleRunner::load(model_config) {
-            Err(e) => {
-                eprintln!(
-                    "  [Candle] Could not load model – skipping section 2.\n  Reason: {e}\n\
-                     Tip: ensure you have internet access for the first run (model is cached\n\
-                     afterwards). You can also set HF_TOKEN if the repo is gated.\n"
-                );
-            }
-            Ok(mut runner) => {
                 println!(
-                    "  Model loaded in {} ms (excluded from throughput numbers)\n",
-                    runner.model_load_time_ms
+                    "  Selected model: {} (key: '{}')",
+                    model_config.display_name, model_key
                 );
+                println!("  Loading model: {} …\n", model_config.display_name);
 
                 // Warm-up pass
                 println!("  Warming up with '{}' prompt …", WARMUP_PROMPT.name);
@@ -333,9 +290,6 @@ fn main() {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Section 3 – Training benchmark with Burn TUI dashboard
-    // ──────────────────────────────────────────────────────────────────────────
     #[cfg(feature = "train")]
     {
         use burn::backend::Autodiff;
@@ -359,23 +313,68 @@ fn main() {
             println!(" Model: {}  (training)", model_name.to_uppercase());
             println!("{:->60}", "");
 
-            // NdArray + Autodiff (CPU)
-            run_training_benchmark::<Autodiff<NdArray>>(
-                gpt_config,
-                NdArrayDevice::Cpu,
-                "NdArray-Autodiff (CPU)",
-                train_epochs,
-                train_batch,
-            );
+            if train_transpose_only {
+                #[cfg(feature = "tch")]
+                run_training_benchmark::<Autodiff<LibTorch<f32>>, model::GptTranspose<Autodiff<LibTorch<f32>>>, _>(
+                    gpt_config,
+                    LibTorchDevice::Cpu,
+                    "LibTorch-Autodiff (CPU)",
+                    if gpt_config.hidden_size <= 128 { "tiny-transpose" } else { "small-transpose" },
+                    train_epochs,
+                    train_batch,
+                    model::GptTranspose::<Autodiff<LibTorch<f32>>>::new,
+                );
 
-            // WGPU + Autodiff (GPU)
-            run_training_benchmark::<Autodiff<Wgpu>>(
-                gpt_config,
-                WgpuDevice::default(),
-                "WGPU-Autodiff (GPU)",
-                train_epochs,
-                train_batch,
-            );
+                run_training_benchmark::<Autodiff<NdArray>, model::GptTranspose<Autodiff<NdArray>>, _>(
+                    gpt_config,
+                    NdArrayDevice::Cpu,
+                    "NdArray-Autodiff (CPU)",
+                    if gpt_config.hidden_size <= 128 { "tiny-transpose" } else { "small-transpose" },
+                    train_epochs,
+                    train_batch,
+                    model::GptTranspose::<Autodiff<NdArray>>::new,
+                );
+
+                run_training_benchmark::<Autodiff<Wgpu>, model::GptTranspose<Autodiff<Wgpu>>, _>(
+                    gpt_config,
+                    WgpuDevice::default(),
+                    "WGPU-Autodiff (GPU)",
+                    if gpt_config.hidden_size <= 128 { "tiny-transpose" } else { "small-transpose" },
+                    train_epochs,
+                    train_batch,
+                    model::GptTranspose::<Autodiff<Wgpu>>::new,
+                );
+            } else {
+                #[cfg(feature = "tch")]
+                run_training_benchmark::<Autodiff<LibTorch<f32>>, Gpt<Autodiff<LibTorch<f32>>>, _>(
+                    gpt_config,
+                    LibTorchDevice::Cpu,
+                    "LibTorch-Autodiff (CPU)",
+                    if gpt_config.hidden_size <= 128 { "tiny" } else { "small" },
+                    train_epochs,
+                    train_batch,
+                    Gpt::<Autodiff<LibTorch<f32>>>::new,
+                );
+
+                run_training_benchmark::<Autodiff<NdArray>, Gpt<Autodiff<NdArray>>, _>(
+                    gpt_config,
+                    NdArrayDevice::Cpu,
+                    "NdArray-Autodiff (CPU)",
+                    if gpt_config.hidden_size <= 128 { "tiny" } else { "small" },
+                    train_epochs,
+                    train_batch,
+                    Gpt::<Autodiff<NdArray>>::new,
+                );
+
+                run_training_benchmark::<Autodiff<Wgpu>, Gpt<Autodiff<Wgpu>>, _>(
+                    gpt_config,
+                    WgpuDevice::default(),
+                    "WGPU-Autodiff (GPU)",
+                    if gpt_config.hidden_size <= 128 { "tiny" } else { "small" },
+                    train_epochs,
+                    train_batch,
+                    Gpt::<Autodiff<Wgpu>>::new,
+                );
         }
     }
 
@@ -395,8 +394,8 @@ fn print_system_info() {
     println!("\n📊 System Information:");
     println!("  • OS: {}", std::env::consts::OS);
     println!("  • Architecture: {}", std::env::consts::ARCH);
-    println!("  • Burn Version: 0.14");
-    
+    println!("  • Burn Version: 0.20.1");
+
     #[cfg(target_os = "macos")]
     println!("  • Note: WGPU on macOS uses Metal backend");
     

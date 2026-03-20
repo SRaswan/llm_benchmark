@@ -1,17 +1,3 @@
-/// Pure-Rust LLM inference using HuggingFace Candle.
-///
-/// This module loads a GGUF-quantised model (default: TinyLlama-1.1B-Q4_K_M)
-/// from the HuggingFace Hub and runs autoregressive generation, measuring the
-/// same metrics as the Burn benchmarks so the results can be directly compared.
-///
-/// # Apples-to-apples notes
-/// • The same GGUF file is used here and, via `burn-tch`, by the LibTorch
-///   backend when feature `tch` is also enabled.
-/// • Temperature is always 0 (greedy), eliminating sampling randomness.
-/// • Model load time is measured separately and excluded from throughput.
-/// • We measure *output* tokens / second (the number that actually required
-///   a forward pass through the decoder), not the input (prefilled) tokens.
-
 #[cfg(feature = "candle")]
 pub mod inner {
     use std::path::PathBuf;
@@ -26,64 +12,65 @@ pub mod inner {
     use crate::benchmark::{GenerationStats, MemoryStats, measure_memory_usage};
     use crate::prompts::BenchmarkPrompt;
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // Model configuration
-    // ──────────────────────────────────────────────────────────────────────────
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum CandleModelKind {
+        TinyLlama,
+        Llama32_1B,
+        Phi4,
+        Qwen25_05B,
+    }
 
-    /// Which GGUF model to download and benchmark.
-    ///
-    /// Each variant stores:
-    ///   - `hf_repo`:        the HuggingFace repository that hosts the GGUF weights
-    ///   - `gguf_file`:      the specific quantised file to download from that repo
-    ///   - `tokenizer_repo`: the repo that holds `tokenizer.json` (usually the
-    ///                        original non-quantised model repo)
-    ///   - `display_name`:   a human-readable label for results tables
-    ///   - `requires_token`: whether the repo is gated (needs HF_TOKEN to access)
+    impl CandleModelKind {
+        pub fn parse(s: &str) -> Option<Self> {
+            match s.to_lowercase().as_str() {
+                "tinyllama" | "tiny_llama" => Some(Self::TinyLlama),
+                "llama32" | "llama3.2" | "llama3.2-1b" | "llama-3.2-1b" => Some(Self::Llama32_1B),
+                "phi4" | "phi-4" => Some(Self::Phi4),
+                "qwen" | "qwen2.5" | "qwen2.5-0.5b" | "qwen2_5_0_5b" => Some(Self::Qwen25_05B),
+                _ => None,
+            }
+        }
+
+        pub fn all() -> Vec<Self> {
+            vec![
+                Self::TinyLlama,
+                Self::Llama32_1B,
+                Self::Phi4,
+                Self::Qwen25_05B,
+            ]
+        }
+
+        pub fn config(&self) -> CandleModelConfig {
+            match self {
+                Self::TinyLlama => CandleModelConfig::tiny_llama(),
+                Self::Llama32_1B => CandleModelConfig::llama32_1b(),
+                Self::Phi4 => CandleModelConfig::phi4(),
+                Self::Qwen25_05B => CandleModelConfig::qwen25_05b(),
+            }
+        }
+    }
+
     #[derive(Debug, Clone)]
     pub struct CandleModelConfig {
         pub hf_repo: &'static str,
         pub gguf_file: &'static str,
         pub tokenizer_repo: &'static str,
         pub display_name: &'static str,
-        /// If true, the user needs to set HF_TOKEN or HUGGING_FACE_HUB_TOKEN
-        /// as an environment variable before downloading this model.
+        
         pub requires_token: bool,
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // MODEL REGISTRY
-    //
-    // This is the list of models users can choose from.  To add a new model,
-    // just append another entry here.  The key (e.g. "tinyllama") is what the
-    // user types on the command line or sets in the env var.
-    //
-    // All models MUST be GGUF-format, LLaMA-architecture compatible, because
-    // Candle's `quantized_llama::ModelWeights` is the loader we use.
-    // ──────────────────────────────────────────────────────────────────────────
-
-    /// A single entry in the model registry: a short key + its config.
+    
     pub struct ModelRegistryEntry {
-        /// Short key the user types, e.g. "tinyllama"
         pub key: &'static str,
-        /// Human-readable description shown in the menu
         pub description: &'static str,
-        /// Approximate download size so users know what they're in for
         pub size_hint: &'static str,
-        /// The actual config used to load the model
         pub config: CandleModelConfig,
     }
 
-    /// Returns the full list of models we support.
-    ///
-    /// WHY a function instead of a const?  Rust doesn't allow const Vec or
-    /// const trait objects easily, and a function is simpler to read/maintain.
-    /// This gets called once at startup so performance doesn't matter.
     pub fn model_registry() -> Vec<ModelRegistryEntry> {
         vec![
-            // ── TinyLlama (default) ─────────────────────────────────────
-            // Very small (1.1B params), runs on CPU in reasonable time.
-            // Q4_K_M quantisation keeps the file around 600-700 MB.
-            // No gated access — anyone can download it.
+            
             ModelRegistryEntry {
                 key: "tinyllama",
                 description: "TinyLlama 1.1B Chat (Q4_K_M quantised)",
@@ -96,10 +83,7 @@ pub mod inner {
                     requires_token: false,
                 },
             },
-            // ── Phi-3 Mini ──────────────────────────────────────────────
-            // Microsoft's small-but-capable model (3.8B params).
-            // Noticeably slower than TinyLlama but produces much better
-            // output, good for showing quality vs speed tradeoffs.
+            
             ModelRegistryEntry {
                 key: "phi3",
                 description: "Phi-3 Mini 4K Instruct (Q4 quantised)",
@@ -112,10 +96,7 @@ pub mod inner {
                     requires_token: false,
                 },
             },
-            // ── Llama 3.2 1B ────────────────────────────────────────────
-            // Meta's latest small model.  Gated repo — user needs to:
-            //   1. Accept the license on huggingface.co
-            //   2. Set HF_TOKEN env var with their access token
+            
             ModelRegistryEntry {
                 key: "llama3-1b",
                 description: "Llama 3.2 1B Instruct (Q4_K_M) [needs HF token]",
@@ -128,9 +109,7 @@ pub mod inner {
                     requires_token: true,
                 },
             },
-            // ── Llama 3.2 3B ────────────────────────────────────────────
-            // Bigger sibling of the 1B — better quality, more compute.
-            // Also gated.
+            
             ModelRegistryEntry {
                 key: "llama3-3b",
                 description: "Llama 3.2 3B Instruct (Q4_K_M) [needs HF token]",
@@ -146,10 +125,7 @@ pub mod inner {
         ]
     }
 
-    /// Look up a model config by its short key (case-insensitive).
-    ///
-    /// Returns None if the key doesn't match any registered model.
-    /// This is called from main.rs when parsing the user's CLI arg.
+    
     pub fn resolve_model(key: &str) -> Option<CandleModelConfig> {
         let key_lower = key.to_lowercase();
         model_registry()
@@ -158,10 +134,7 @@ pub mod inner {
             .map(|entry| entry.config)
     }
 
-    /// Print a nicely formatted table of all available models.
-    ///
-    /// Called when the user passes `--list-models` or an invalid model key,
-    /// so they can see what's available.
+    
     pub fn print_available_models() {
         println!("\n  Available models for Section 2 (Candle):\n");
         println!(
@@ -176,7 +149,7 @@ pub mod inner {
                 entry.key,
                 entry.description,
                 entry.size_hint,
-                // Show a clear indicator if the user needs an HF token
+                
                 if entry.config.requires_token { "yes" } else { "no" },
             );
         }
@@ -189,15 +162,6 @@ pub mod inner {
         println!();
     }
 
-    // ──────────────────────────────────────────────────────────────────────────
-    // ORIGINAL CODE BELOW — kept mostly unchanged.
-    // The only removed piece is the old `impl CandleModelConfig` block with
-    // `tiny_llama()` and `phi3_mini()` — those are now in the registry above.
-    // ──────────────────────────────────────────────────────────────────────────
-
-    // ──────────────────────────────────────────────────────────────────────────
-    // Model wrapper
-    // ──────────────────────────────────────────────────────────────────────────
 
     pub struct CandleRunner {
         pub model: ModelWeights,
@@ -208,13 +172,9 @@ pub mod inner {
     }
 
     impl CandleRunner {
-        /// Download (or use cached) model + tokeniser, load into memory.
-        /// Returns `Err` with a human-readable message on any failure so the
-        /// caller can skip the Candle section gracefully.
+        
         pub fn load(config: CandleModelConfig) -> Result<Self, String> {
-            // ── Token check ─────────────────────────────────────────────
-            // If this model requires an HF token, check early and give a
-            // clear error message instead of a cryptic download failure.
+            
             if config.requires_token {
                 let has_token = std::env::var("HUGGING_FACE_HUB_TOKEN").is_ok()
                     || std::env::var("HF_TOKEN").is_ok();
@@ -232,11 +192,7 @@ pub mod inner {
 
             let api = build_hf_api()?;
 
-            // ── Device selection ────────────────────────────────────────
-            // Pick the best available compute device:
-            //   - Metal (Apple GPU) if --features metal
-            //   - CUDA (NVIDIA GPU) if --features cuda
-            //   - CPU otherwise
+            
             #[cfg(feature = "metal")]
             let device = Device::new_metal(0)
                 .map_err(|e| format!("Metal device error: {e}"))?;
@@ -258,10 +214,8 @@ pub mod inner {
                 }
             );
 
-            // ── Download / cache model weights ──────────────────────────
             let (gguf_path, tokenizer_path) = resolve_model_paths(&api, &config)?;
 
-            // ── Load model ──────────────────────────────────────────────
             println!("  [Candle] Loading weights into memory …");
             let t0 = Instant::now();
             let mut file = std::fs::File::open(&gguf_path)
@@ -275,7 +229,6 @@ pub mod inner {
                 "  [Candle] Model loaded in {model_load_time_ms} ms"
             );
 
-            // ── Load tokeniser ──────────────────────────────────────────
             let tokenizer = Tokenizer::from_file(tokenizer_path)
                 .map_err(|e| format!("Tokeniser load error: {e}"))?;
 
@@ -320,7 +273,6 @@ pub mod inner {
                 .or_else(|| self.tokenizer.token_to_id("<|endoftext|>"))
                 .unwrap_or(2); // llama default EOS
 
-            // ── Prefill ──────────────────────────────────────────────────
             let prefill_start = Instant::now();
             let logits = self
                 .model
@@ -342,7 +294,6 @@ pub mod inner {
                 ));
             }
 
-            // ── Decode loop ──────────────────────────────────────────────
             let memory_before = MemoryStats::current().unwrap_or_else(|e| {
                 eprintln!("Warning: Failed to measure memory before decode: {}", e);
                 MemoryStats { rss_bytes: 0, vsz_bytes: 0 }

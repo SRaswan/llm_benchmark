@@ -44,7 +44,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # Utilities
 serde = { version = "1.0", features = ["derive"] }
 rand = "0.8"
-sys-info = "0.9"
 sysinfo = "0.30"
 
 [dev-dependencies]

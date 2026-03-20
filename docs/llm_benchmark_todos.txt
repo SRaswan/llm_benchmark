@@ -1,0 +1,57 @@
+================================================================================
+  llm_benchmark — TODO List
+  Derived from team chat (Discord) decisions
+================================================================================
+
+CODING TASKS
+─────────────
+[x] Fix Section 1 timing — DONE (commit 791f617 on merging branch)
+    - Added B::sync(device) after model.forward() in warmup + benchmark loops
+    - Replaced /proc/self/statm with sysinfo crate for cross-platform memory
+    - Fixed version string 0.14 → 0.20.1, removed duplicate model_configs,
+      removed unused sys-info dependency
+    - Verified: realistic ms-level latencies, non-zero RSS on macOS
+
+[ ] Fix Section 2/3 compile errors (candle_runner.rs) — OFFLOADED
+    - 13 compile errors from incomplete refactor (not caused by Section 1 fix)
+    - Missing: constructor methods, local_dir_name field, build_hf_api arg,
+      summarize_model_run function
+
+[ ] Merge branches into one clean branch
+    - Currently fragmented: benchmarking, sam-benchmarking, merging, section-1
+    - merging branch has most complete code (python benchmark + CLI improvements)
+    - Need to consolidate into a single working branch
+
+[ ] De-GPT the llm_benchmark code
+    - Remove AI-generated bloat and unnecessary comments
+    - Clean up verbose/over-engineered patterns
+
+[ ] Combine llm_benchmark with fuzzburn into one project
+    - Final deliverable should be a unified repo/report
+    - fuzzburn provides correctness (fuzzing) dimension
+    - llm_benchmark provides performance (benchmarking) dimension
+
+DATA COLLECTION
+───────────────
+[ ] Collect all benchmark data from a single machine
+    - Need consistent results from one environment for the report tables
+    - Run all sections + python benchmark on the same machine
+    - Sections 2 and 3 data exists but Section 1 is invalid
+    - Python benchmark data exists (PyTorch MPS)
+
+REPORT (291p_report_latex.txt)
+──────────────────────────────
+[ ] Add fuzzburn section to the report
+    - Tensor-level differential fuzzing of Burn (SSA IR, 2D tensors)
+    - 17 autograd crashes found
+    - Currently not in the report at all
+
+[ ] Add llm_benchmark section to the report
+    - All three benchmark sections + Python comparison
+    - Data tables (once Section 1 is fixed and data re-collected)
+    - Currently only raw data tables exist at top of report (DOCS TAB 1)
+
+[ ] Write combined narrative
+    - Connect ad_trait fuzzing → fuzzburn → llm_benchmark
+    - Correctness + performance = complete evaluation of Rust ML ecosystem
+================================================================================
