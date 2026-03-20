@@ -54,6 +54,32 @@ struct CliConfig {
     section3_only: bool,
 }
 
+struct RuntimeConfig {
+    section3_only: bool,
+    candle_model: String,
+    hf_token: Option<String>,
+}
+
+impl RuntimeConfig {
+    fn from_cli(cli: &CliConfig) -> Self {
+        let hf_token = std::env::var("LLM_BENCH_HF_TOKEN")
+            .or_else(|_| std::env::var("HF_TOKEN"))
+            .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
+            .ok();
+
+        let candle_model = cli
+            .model_key
+            .clone()
+            .unwrap_or_else(|| "tinyllama".to_string());
+
+        Self {
+            section3_only: cli.section3_only,
+            candle_model,
+            hf_token,
+        }
+    }
+}
+
 /// Parse command-line arguments into a CliConfig.
 ///
 /// This is intentionally simple — just iterates through args looking for
@@ -111,6 +137,7 @@ fn parse_cli() -> CliConfig {
 fn main() {
     // ── Parse CLI arguments ─────────────────────────────────────────────
     let cli = parse_cli();
+    let runtime = RuntimeConfig::from_cli(&cli);
 
     // ── Handle --list-models early exit ──────────────────────────────────
     // If the user just wants to see what models are available, print and quit.
@@ -240,12 +267,9 @@ fn main() {
     // ──────────────────────────────────────────────────────────────────────────
     #[cfg(feature = "candle")]
     {
-        if cli.section3_only {
-            // Skip Candle section if running training-only mode.
-        } else {
-        use candle_runner::inner::{CandleRunner, resolve_model, print_available_models};
+        if !cli.section3_only {
+            use candle_runner::inner::{print_available_models, resolve_model, CandleRunner};
 
-        if !runtime.section3_only {
             println!("\n{:=<80}", "");
             println!(" SECTION 2: Candle Pure-Rust LLM (real weights, real prompts)");
             println!("{:=<80}\n", "");
@@ -256,69 +280,56 @@ fn main() {
                  per-token latency p50/p95.\n"
             );
 
-        // ── Resolve which model to use ──────────────────────────────────
-        //
-        // Priority:
-        //   1. --model CLI arg  (already in cli.model_key)
-        //   2. LLM_BENCH_MODEL env var  (also already merged into cli.model_key)
-        //   3. Default to "tinyllama"
-        //
-        // If the user gave a key that doesn't match anything in the
-        // registry, we show the available models and bail out.
-        let model_key = cli.model_key
-            .as_deref()          // Option<String> → Option<&str>
-            .unwrap_or("tinyllama");  // default if nothing was specified
+            // ── Resolve which model to use ──────────────────────────────────
+            //
+            // Priority:
+            //   1. --model CLI arg  (already in cli.model_key)
+            //   2. LLM_BENCH_MODEL env var  (also already merged into cli.model_key)
+            //   3. Default to "tinyllama"
+            //
+            // If the user gave a key that doesn't match anything in the
+            // registry, we show the available models and bail out.
+            let model_key = cli
+                .model_key
+                .as_deref() // Option<String> → Option<&str>
+                .unwrap_or("tinyllama"); // default if nothing was specified
 
-        let model_config = match resolve_model(model_key) {
-            Some(config) => config,
-            None => {
-                // The user typed something we don't recognise.
-                // Show them what's available so they can fix it.
-                eprintln!(
-                    "  Error: unknown model key '{}'\n",
-                    model_key
-                );
-                print_available_models();
-                // Don't crash the whole program — just skip Section 2.
-                // Section 1 results (if any) are still useful.
-                eprintln!("  Skipping Section 2.\n");
-                return;
-            }
-        };
+            let model_config = match resolve_model(model_key) {
+                Some(config) => Some(config),
+                None => {
+                    // The user typed something we don't recognise.
+                    // Show them what's available so they can fix it.
+                    eprintln!("  Error: unknown model key '{}'\n", model_key);
+                    print_available_models();
+                    // Don't crash the whole program — just skip Section 2.
+                    // Section 1 results (if any) are still useful.
+                    eprintln!("  Skipping Section 2.\n");
+                    None
+                }
+            };
 
-        println!("  Selected model: {} (key: '{}')", model_config.display_name, model_key);
-        println!("  Loading model: {} …\n", model_config.display_name);
-
-        match CandleRunner::load(model_config) {
-            Err(e) => {
-                eprintln!(
-                    "  [Candle] Could not load model – skipping section 2.\n  Reason: {e}\n\
-                     Tip: ensure you have internet access for the first run (model is cached\n\
-                     afterwards). You can also set HF_TOKEN if the repo is gated.\n"
-                );
-            }
-            Ok(mut runner) => {
-                println!(
-                    "  Model loaded in {} ms (excluded from throughput numbers)\n",
-                    runner.model_load_time_ms
-                );
-
-                if model_config.requires_token && runtime.hf_token.is_none() {
-                    eprintln!(
-                        "Skipping {}: this model likely requires a Hugging Face token. \
-                         Set LLM_BENCH_HF_TOKEN, HF_TOKEN, or HUGGING_FACE_HUB_TOKEN.",
-                        model_config.display_name
-                    );
-                    continue;
+            if let Some(model_config) = model_config {
+                if let Some(token) = runtime.hf_token.as_deref() {
+                    if std::env::var("HF_TOKEN").is_err()
+                        && std::env::var("HUGGING_FACE_HUB_TOKEN").is_err()
+                    {
+                        std::env::set_var("HF_TOKEN", token);
+                    }
                 }
 
-                println!("\n{:->80}", "");
-                println!(" Running Candle benchmark for {}", model_config.display_name);
-                println!("{:->80}\n", "");
+                println!(
+                    "  Selected model: {} (key: '{}')",
+                    model_config.display_name, model_key
+                );
+                println!("  Loading model: {} …\n", model_config.display_name);
 
-                match CandleRunner::load(model_config.clone(), runtime.hf_token.as_deref()) {
+                match CandleRunner::load(model_config.clone()) {
                     Err(e) => {
-                        eprintln!("  [Candle] Could not load model – skipping.\n  Reason: {e}\n");
+                        eprintln!(
+                            "  [Candle] Could not load model – skipping section 2.\n  Reason: {e}\n\
+                             Tip: ensure you have internet access for the first run (model is cached\n\
+                             afterwards). You can also set HF_TOKEN if the repo is gated.\n"
+                        );
                     }
                     Ok(mut runner) => {
                         println!(
@@ -463,16 +474,16 @@ fn main() {
                     Gpt::<Autodiff<NdArray>>::new,
                 );
 
-            // WGPU + Autodiff (GPU)
-            run_training_benchmark::<Autodiff<Wgpu>, Gpt<Autodiff<Wgpu>>, _>(
-                gpt_config,
-                WgpuDevice::default(),
-                "WGPU-Autodiff (GPU)",
-                if gpt_config.hidden_size <= 128 { "tiny" } else { "small" },
-                train_epochs,
-                train_batch,
-                Gpt::<Autodiff<Wgpu>>::new,
-            );
+                // WGPU + Autodiff (GPU)
+                run_training_benchmark::<Autodiff<Wgpu>, Gpt<Autodiff<Wgpu>>, _>(
+                    gpt_config,
+                    WgpuDevice::default(),
+                    "WGPU-Autodiff (GPU)",
+                    if gpt_config.hidden_size <= 128 { "tiny" } else { "small" },
+                    train_epochs,
+                    train_batch,
+                    Gpt::<Autodiff<Wgpu>>::new,
+                );
         }
     }
 
