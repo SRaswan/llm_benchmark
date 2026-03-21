@@ -510,3 +510,6 @@ pub mod inner {
 pub mod inner {
     pub struct CandleRunner;
 }
+
+#[cfg(feature = "candle")]
+pub use inner::{print_available_models, resolve_model, CandleRunner};

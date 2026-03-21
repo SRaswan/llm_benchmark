@@ -4,7 +4,6 @@ pub mod inner {
     use std::time::{Duration, Instant};
 
     use burn::{
-        backend::Autodiff,
         data::{
             dataloader::{batcher::Batcher, DataLoaderBuilder},
             dataset::Dataset,
@@ -393,3 +392,6 @@ pub mod inner {
 
 #[cfg(not(feature = "train"))]
 pub mod inner {}
+
+#[cfg(feature = "train")]
+pub use inner::run_training_benchmark;
