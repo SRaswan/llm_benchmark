@@ -1,6 +1,29 @@
+/// Training benchmark using Burn's `LearnerBuilder` and its built-in TUI dashboard.
+///
+/// What the TUI shows (live, while training runs):
+///   - Loss curve (train + validation) plotted in the terminal
+///   - Items/second (= training throughput, forward + backward + optimiser)
+///   - Epoch / step progress bars
+///   - Final summary table after `.fit()` returns
+///
+/// How it works:
+///   Burn wraps any backend with `Autodiff<B>` to enable gradient tracking.
+///   We create a random-token language-modelling dataset (same sizes as the
+///   inference benchmarks), implement `TrainStep` / `ValidStep` for `Gpt`,
+///   and hand everything to `LearnerBuilder`.  The TUI is the **default**
+///   renderer – no extra configuration required.
+///
+/// Apples-to-apples vs inference (Section 1):
+///   - Same `GptConfig` (tiny / small)
+///   - Same batch size and sequence length
+///   - Same backends (NdArray-Autodiff, WGPU-Autodiff)
+///   - Random weights + random tokens → measures pure compute cost, not data loading
+///   - Model load time not included in tokens/sec (identical to Section 1 methodology)
+
 #[cfg(feature = "train")]
 pub mod inner {
     use std::fmt::Display;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use burn::{
@@ -14,21 +37,152 @@ pub mod inner {
         record::CompactRecorder,
         tensor::{backend::{AutodiffBackend, Backend}, Int, Tensor, TensorData},
         train::{
-            metric::LossMetric,
-            ClassificationOutput, InferenceStep, Learner, SupervisedTraining, TrainOutput, TrainStep,
+            metric::{state::{FormatOptions, NumericMetricState}, LossMetric},
+            ClassificationOutput, LearnerBuilder, TrainOutput, TrainStep, ValidStep,
         },
     };
-    use burn_optim::lr_scheduler::constant::ConstantLr;
+    use sysinfo::System;
 
-    use crate::model::{Gpt, GptConfig, GptTranspose};
+    use crate::model::{Gpt, GptConfig};
 
-    
+    /// Per-process RAM usage metric for the current process.
+    pub struct ProcessMemory {
+        sys: System,
+        pid: sysinfo::Pid,
+    }
+
+    impl ProcessMemory {
+        pub fn new() -> Self {
+            Self {
+                sys: System::new(),
+                pid: sysinfo::Pid::from_u32(std::process::id()),
+            }
+        }
+
+        fn refresh(&mut self) -> Option<u64> {
+            // sysinfo reports memory in bytes.
+            self.sys.refresh_processes();
+            self.sys.process(self.pid).map(|p| p.memory())
+        }
+    }
+
+    impl Default for ProcessMemory {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl burn::train::metric::Metric for ProcessMemory {
+        const NAME: &'static str = "Process Memory";
+        type Input = ();
+
+        fn update(
+            &mut self,
+            _item: &Self::Input,
+            _metadata: &burn::train::metric::MetricMetadata,
+        ) -> burn::train::metric::MetricEntry {
+            let mem_bytes = self.refresh().unwrap_or(0);
+            let mem_mb = mem_bytes as f64 / (1024.0 * 1024.0);
+            let mem_gb = mem_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+            burn::train::metric::MetricEntry::new(
+                Self::NAME.to_string(),
+                format!("RSS: {:.2} MB ({:.2} GB)", mem_mb, mem_gb),
+                format!("{mem_mb:.6}"),
+            )
+        }
+
+        fn clear(&mut self) {}
+    }
+
+    impl burn::train::metric::Numeric for ProcessMemory {
+        fn value(&self) -> f64 {
+            // Best-effort numeric value; update() already refreshed.
+            self.sys
+                .process(self.pid)
+                .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
+                .unwrap_or(0.0)
+        }
+    }
+
+    /// Tracks per-step wall-clock latency (train steps).
+    struct StepMetricsState {
+        samples_us: Vec<u64>,
+        last_us: u64,
+    }
+
+    pub struct StepLatency {
+        state: Arc<Mutex<StepMetricsState>>,
+        last_instant: Option<Instant>,
+        numeric_state: NumericMetricState,
+    }
+
+    impl StepLatency {
+        pub fn new(state: Arc<Mutex<StepMetricsState>>) -> Self {
+            Self {
+                state,
+                last_instant: None,
+                numeric_state: NumericMetricState::new(),
+            }
+        }
+    }
+
+    impl burn::train::metric::Metric for StepLatency {
+        const NAME: &'static str = "Step Latency Train";
+        type Input = ();
+
+        fn update(
+            &mut self,
+            _item: &Self::Input,
+            _metadata: &burn::train::metric::MetricMetadata,
+        ) -> burn::train::metric::MetricEntry {
+            let now = Instant::now();
+            let mut last_us = 0u64;
+            if let Some(prev) = self.last_instant {
+                last_us = now.duration_since(prev).as_micros() as u64;
+                if let Ok(mut state) = self.state.lock() {
+                    state.last_us = last_us;
+                    state.samples_us.push(last_us);
+                }
+            }
+            self.last_instant = Some(now);
+
+            let n = self.state.lock().map(|v| v.samples_us.len()).unwrap_or(0);
+            self.numeric_state.update(
+                last_us as f64,
+                1,
+                FormatOptions::new(Self::NAME)
+                    .unit("us")
+                    .precision(0),
+            )
+        }
+
+        fn clear(&mut self) {
+            self.numeric_state.reset();
+            self.last_instant = None;
+        }
+    }
+
+    impl burn::train::metric::Numeric for StepLatency {
+        fn value(&self) -> f64 {
+            self.numeric_state.value()
+        }
+    }
+
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Dataset – random token sequences
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// A single language-modelling example: input tokens and next-token targets.
     #[derive(Clone, Debug)]
     pub struct LMItem {
+        /// Token IDs for positions 0..seq_len
         pub input_ids: Vec<i32>,
+        /// Token IDs for positions 1..seq_len+1 (next-token targets)
         pub target_ids: Vec<i32>,
     }
 
+    /// In-memory dataset of randomly generated token sequences.
     pub struct RandomLMDataset {
         items: Vec<LMItem>,
     }
@@ -62,25 +216,29 @@ pub mod inner {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // Batcher – stacks individual items into a batched tensor struct
+    // ══════════════════════════════════════════════════════════════════════════
+
     #[derive(Clone, Debug)]
     pub struct LMBatch<B: Backend> {
-        pub input_ids: Tensor<B, 2, Int>,   
-        pub target_ids: Tensor<B, 2, Int>,  
+        pub input_ids: Tensor<B, 2, Int>,   // [batch, seq]
+        pub target_ids: Tensor<B, 2, Int>,  // [batch, seq]
     }
 
     #[derive(Clone)]
     pub struct LMBatcher<B: Backend> {
-        _b: std::marker::PhantomData<B>,
+        device: B::Device,
     }
 
     impl<B: Backend> LMBatcher<B> {
-        pub fn new() -> Self {
-            Self { _b: std::marker::PhantomData }
+        pub fn new(device: B::Device) -> Self {
+            Self { device }
         }
     }
 
-    impl<B: Backend> Batcher<B, LMItem, LMBatch<B>> for LMBatcher<B> {
-        fn batch(&self, items: Vec<LMItem>, device: &B::Device) -> LMBatch<B> {
+    impl<B: Backend> Batcher<LMItem, LMBatch<B>> for LMBatcher<B> {
+        fn batch(&self, items: Vec<LMItem>) -> LMBatch<B> {
             let batch_size = items.len();
             let seq_len = items[0].input_ids.len();
 
@@ -95,13 +253,13 @@ pub mod inner {
 
             let input_ids = Tensor::<B, 1, Int>::from_data(
                 TensorData::new(input_flat, [batch_size * seq_len]),
-                device,
+                &self.device,
             )
             .reshape([batch_size, seq_len]);
 
             let target_ids = Tensor::<B, 1, Int>::from_data(
                 TensorData::new(target_flat, [batch_size * seq_len]),
-                device,
+                &self.device,
             )
             .reshape([batch_size, seq_len]);
 
@@ -109,58 +267,37 @@ pub mod inner {
         }
     }
 
-    
-    impl<B: AutodiffBackend> TrainStep for Gpt<B> {
-        type Input = LMBatch<B>;
-        type Output = ClassificationOutput<B>;
+    // ══════════════════════════════════════════════════════════════════════════
+    // Training / validation steps
+    // ══════════════════════════════════════════════════════════════════════════
 
-        fn step(&self, batch: Self::Input) -> TrainOutput<Self::Output> {
+    impl<B: AutodiffBackend> TrainStep<LMBatch<B>, ClassificationOutput<B>> for Gpt<B> {
+        fn step(&self, batch: LMBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
             let output = lm_forward(self, batch);
+            // `loss` is inside `output`; clone it for backward before moving into output
             let grads = output.loss.backward();
             TrainOutput::new(self, grads, output)
         }
     }
 
-    impl<B: Backend> InferenceStep for Gpt<B> {
-        type Input = LMBatch<B>;
-        type Output = ClassificationOutput<B>;
-
-        fn step(&self, batch: Self::Input) -> Self::Output {
+    impl<B: Backend> ValidStep<LMBatch<B>, ClassificationOutput<B>> for Gpt<B> {
+        fn step(&self, batch: LMBatch<B>) -> ClassificationOutput<B> {
             lm_forward(self, batch)
         }
     }
 
-    impl<B: AutodiffBackend> TrainStep for GptTranspose<B> {
-        type Input = LMBatch<B>;
-        type Output = ClassificationOutput<B>;
-
-        fn step(&self, batch: Self::Input) -> TrainOutput<Self::Output> {
-            let output = lm_forward_transpose_train(self, batch);
-            let aux_loss = transpose_repro_loss::<B>(output.output.clone());
-            let loss = output.loss.clone() + aux_loss * 0.0001;
-            let grads = loss.backward();
-            TrainOutput::new(self, grads, output)
-        }
-    }
-
-    impl<B: Backend> InferenceStep for GptTranspose<B> {
-        type Input = LMBatch<B>;
-        type Output = ClassificationOutput<B>;
-
-        fn step(&self, batch: Self::Input) -> Self::Output {
-            lm_forward_transpose(self, batch)
-        }
-    }
-
+    /// Shared forward + loss computation used by both train and valid steps.
     fn lm_forward<B: Backend>(
         model: &Gpt<B>,
         batch: LMBatch<B>,
     ) -> ClassificationOutput<B> {
         let [batch_size, seq_len] = batch.input_ids.dims();
-        let logits = model.forward(batch.input_ids); 
+        let logits = model.forward(batch.input_ids); // [batch, seq, vocab]
         let vocab = logits.dims()[2];
 
+        // Flatten to [batch*seq, vocab] for cross-entropy
         let logits_flat = logits.reshape([batch_size * seq_len, vocab]);
+        // Flatten targets to [batch*seq]
         let targets_flat = batch.target_ids.reshape([batch_size * seq_len]);
 
         let loss = CrossEntropyLossConfig::new()
@@ -170,87 +307,49 @@ pub mod inner {
         ClassificationOutput::new(loss, logits_flat, targets_flat)
     }
 
-    fn lm_forward_transpose<B: Backend>(
-        model: &GptTranspose<B>,
-        batch: LMBatch<B>,
-    ) -> ClassificationOutput<B> {
-        let [batch_size, seq_len] = batch.input_ids.dims();
-        let logits = model.forward_infer(batch.input_ids); 
-        let vocab = logits.dims()[2];
+    // ══════════════════════════════════════════════════════════════════════════
+    // Public entry point
+    // ══════════════════════════════════════════════════════════════════════════
 
-        let logits_flat = logits.reshape([batch_size * seq_len, vocab]);
-        let targets_flat = batch.target_ids.reshape([batch_size * seq_len]);
-
-        let loss = CrossEntropyLossConfig::new()
-            .init(&logits_flat.device())
-            .forward(logits_flat.clone(), targets_flat.clone());
-
-        ClassificationOutput::new(loss, logits_flat, targets_flat)
-    }
-
-    fn lm_forward_transpose_train<B: AutodiffBackend>(
-        model: &GptTranspose<B>,
-        batch: LMBatch<B>,
-    ) -> ClassificationOutput<B> {
-        let [batch_size, seq_len] = batch.input_ids.dims();
-        let logits = model.forward_infer(batch.input_ids); 
-        let vocab = logits.dims()[2];
-
-        let logits_flat = logits.reshape([batch_size * seq_len, vocab]);
-        let targets_flat = batch.target_ids.reshape([batch_size * seq_len]);
-
-        let loss = CrossEntropyLossConfig::new()
-            .init(&logits_flat.device())
-            .forward(logits_flat.clone(), targets_flat.clone());
-
-        ClassificationOutput::new(loss, logits_flat, targets_flat)
-    }
-
-    fn transpose_repro_loss<B: AutodiffBackend>(logits_flat: Tensor<B, 2>) -> Tensor<B, 1> {
-        let t0 = logits_flat.clone().transpose().matmul(logits_flat);
-        let t1 = t0.clone().transpose();
-        let t2 = t1.clone() + t0.clone();
-        (t2.clone() * t2).mean()
-    }
-
-    
-    pub fn run_training_benchmark<B, M, F>(
+    /// Run the training benchmark with the Burn TUI dashboard.
+    ///
+    /// The TUI dashboard launches in-place in the terminal and shows:
+    ///  - Live loss curve (train + validation)
+    ///  - Training throughput (items/sec = sequences/sec)
+    ///  - Epoch / step progress bars
+    ///  - Summary table at the end
+    pub fn run_training_benchmark<B>(
         config: &GptConfig,
         device: B::Device,
         backend_name: &str,
-        model_label: &str,
         num_epochs: usize,
         batch_size: usize,
-        build_model: F,
     ) where
         B: AutodiffBackend,
-        M: Display + 'static,
-        M: burn::module::AutodiffModule<B>,
-        <M as burn::module::AutodiffModule<B>>::InnerModule:
-            InferenceStep<Input = LMBatch<B::InnerBackend>, Output = ClassificationOutput<B::InnerBackend>>,
-        M: TrainStep<Input = LMBatch<B>, Output = ClassificationOutput<B>>,
-        F: FnOnce(&GptConfig, &B::Device) -> M,
+        Gpt<B>: Display + 'static,
     {
         println!(
             "\n[ Training: {} | {} model | {} epochs | batch={} | seq={} ]",
             backend_name,
-            model_label,
+            if config.hidden_size <= 128 { "tiny" } else { "small" },
             num_epochs,
             batch_size,
             config.max_seq_len,
         );
 
+        // ── Data ──────────────────────────────────────────────────────────────
         let seq_len = config.max_seq_len;
         let vocab_size = config.vocab_size;
-        
+        // 256 training items, 64 validation items – enough to fill several epochs
+        // without the benchmark taking too long.
         let train_ds = RandomLMDataset::new(256, seq_len, vocab_size);
         let valid_ds = RandomLMDataset::new(64, seq_len, vocab_size);
         let train_steps = steps_per_epoch(train_ds.len(), batch_size);
         let valid_steps = steps_per_epoch(valid_ds.len(), batch_size);
         let total_steps = (train_steps + valid_steps) * num_epochs;
 
-        let batcher_train = LMBatcher::<B>::new();
-        let batcher_valid = LMBatcher::<B::InnerBackend>::new();
+        let batcher_train = LMBatcher::<B>::new(device.clone());
+        let batcher_valid = LMBatcher::<B::InnerBackend>::new(device.clone());
 
         let train_loader = DataLoaderBuilder::new(batcher_train)
             .batch_size(batch_size)
@@ -263,27 +362,38 @@ pub mod inner {
             .num_workers(1)
             .build(valid_ds);
 
-        let model = build_model(config, &device);
+        // ── Model + optimiser ─────────────────────────────────────────────────
+        let model = Gpt::<B>::new(config, &device);
         let optimizer_cfg = AdamConfig::new();
-        let optimizer = optimizer_cfg.init::<B, M>();
-        let lr_scheduler = ConstantLr::new(1e-4_f64);
-        let learner = Learner::new(model, optimizer, lr_scheduler);
 
+        // ── LearnerBuilder – TUI dashboard is the default renderer ────────────
+        // Checkpoints are written to /tmp/llm_benchmark_train/<backend>/
         let artifact_dir = format!(
             "/tmp/llm_benchmark_train/{}",
             backend_name.replace(' ', "_")
         );
 
-        let training = SupervisedTraining::new(&artifact_dir, train_loader, valid_loader)
-            .metric_train_numeric(LossMetric::<burn_ndarray::NdArray>::new())
-            .metric_valid_numeric(LossMetric::<burn_ndarray::NdArray>::new())
+        let step_state = Arc::new(Mutex::new(StepMetricsState {
+            samples_us: Vec::new(),
+            last_us: 0,
+        }));
+        let learner = LearnerBuilder::new(&artifact_dir)
+            // Loss shown as a numeric chart in the TUI
+            .metric_train_numeric(LossMetric::new())
+            .metric_valid_numeric(LossMetric::new())
+            .metric_train_numeric(ProcessMemory::new())
+            .metric_valid_numeric(ProcessMemory::new())
+            .metric_train_numeric(StepLatency::new(step_state.clone()))
+            // Optional file checkpointing (comment out to skip disk writes)
             .with_file_checkpointer(CompactRecorder::new())
             .num_epochs(num_epochs)
+            // Print a textual summary table after .fit() returns
             .summary()
-            .with_training_strategy(burn::train::TrainingStrategy::SingleDevice(device.clone()));
+            .build(model, optimizer_cfg.clone().init::<B, Gpt<B>>(), /* lr */ 1e-4_f64);
 
+        // ── Train – the TUI dashboard appears here ────────────────────────────
         let start = Instant::now();
-        let _trained_model = training.launch(learner);
+        let _trained_model = learner.fit(train_loader, valid_loader);
         let total_time = start.elapsed();
         let avg_step_time = if total_steps > 0 {
             total_time / total_steps as u32
@@ -295,6 +405,18 @@ pub mod inner {
             "\n  Training complete. Checkpoints written to: {}\n",
             artifact_dir
         );
+
+        let (p50, p95) = {
+            let samples = step_state.lock().ok();
+            if let Some(samples) = samples {
+                compute_percentiles_us(&samples.samples_us)
+            } else {
+                (0, 0)
+            }
+        };
+        if p50 > 0 {
+            println!("  Step latency p50/p95: {p50} / {p95} µs");
+        }
 
         let (estimated_kernels, estimated_kernel_launch_us) =
             estimate_kernel_launch_overhead_train(config);
@@ -321,9 +443,9 @@ pub mod inner {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(5);
         let kernels_per_layer: u64 = 12;
-        let base_kernels: u64 = 3; 
+        let base_kernels: u64 = 3; // embeddings + final ln + lm head
         let forward_kernels = base_kernels + kernels_per_layer * config.num_layers as u64;
-        let train_kernels = forward_kernels * 3; 
+        let train_kernels = forward_kernels * 3; // forward + backward + optimizer (rough)
         (train_kernels, train_kernels * per_kernel_us)
     }
 
@@ -342,11 +464,11 @@ pub mod inner {
         let v = config.vocab_size as u64;
 
         let bytes_hidden = b * s * h * 4;
-        let bytes_per_layer = bytes_hidden * 2; 
+        let bytes_per_layer = bytes_hidden * 2; // read + write
         let bytes_logits = b * s * v * 4;
         let forward_bytes =
             bytes_hidden + bytes_per_layer * config.num_layers as u64 + bytes_logits;
-        let train_bytes = forward_bytes * 3; 
+        let train_bytes = forward_bytes * 3; // forward + backward + optimizer (rough)
 
         train_bytes as f64 / avg_step_time.as_secs_f64() / 1e9
     }
@@ -389,6 +511,17 @@ pub mod inner {
         }
     }
 
+    fn compute_percentiles_us(values: &[u64]) -> (u64, u64) {
+        if values.is_empty() {
+            return (0, 0);
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        let n = sorted.len();
+        let p50 = sorted[n / 2];
+        let p95 = sorted[(n as f64 * 0.95) as usize];
+        (p50, p95)
+    }
 }
 
 #[cfg(not(feature = "train"))]
