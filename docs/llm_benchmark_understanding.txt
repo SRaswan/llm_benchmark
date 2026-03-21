@@ -1,0 +1,269 @@
+================================================================================
+  llm_benchmark — Codebase Understanding
+  Repo: https://github.com/SRaswan/llm_benchmark
+  Primary branch: benchmarking
+  Active development: merging (merged benchmarking + sam-benchmarking)
+  Section 1 fix attempt: section-1 (re-adds doc comments from merging cleanup)
+================================================================================
+
+1. WHAT THIS PROJECT IS
+───────────────────────
+An LLM benchmarking suite for Rust that measures inference and training
+performance across multiple Rust ML frameworks and backends. Compares
+Rust-native frameworks (Burn, Candle) against Python/PyTorch to evaluate
+whether Rust is viable for LLM workloads.
+
+Part of a broader research project (CSE 291Y / 291P) titled:
+  "FuzzBurn: Verifying and Benchmarking the Performance of Rust-Native
+   LLM Agents"
+
+The project has three benchmark sections controlled by feature flags,
+plus a Python comparison benchmark.
+
+
+2. THE THREE BENCHMARK SECTIONS + PYTHON COMPARISON
+────────────────────────────────────────────────────
+
+  Section 1: Burn Backend Throughput Comparison  [STATUS: FIXED — commit 791f617]
+  ─────────────────────────────────────────────
+  Purpose:    Apples-to-apples comparison of Burn backends on identical work.
+  What:       A custom GPT-style decoder-only transformer (model.rs) is built
+              with random weights and run in forward-pass-only mode across:
+                - NdArray (pure Rust, CPU)
+                - WGPU (GPU via WebGPU/Metal)
+                - LibTorch (PyTorch C++ bindings, optional via `tch` feature)
+  Model sizes: "tiny" (vocab=512, hidden=128, 2 layers, 2 heads, seq=64)
+               "small" (vocab=2048, hidden=256, 4 layers, 4 heads, seq=128)
+  Methodology: Same GptConfig, same random input tensor shape, same warm-up
+               (3 passes) + 50 iterations. Only the backend differs.
+  Metrics:    Input tokens processed per second (forward-pass throughput),
+              per-iteration latency p50/p95, estimated kernel launch overhead,
+              estimated memory bandwidth (GB/s), peak memory (RSS).
+  Enabled:    Always (no feature flag needed).
+
+  FIXED:      GPU sync barriers added (B::sync(device) after model.forward()),
+              memory measurement replaced with cross-platform sysinfo crate.
+              Verified results: NdArray tiny 2.14ms/59K tok/s, WGPU tiny
+              2.82ms/45K tok/s, WGPU small 4.63ms/27K tok/s (GPU wins on
+              larger model). Non-zero p50 latencies and RSS on macOS.
+
+  Section 2: Candle Pure-Rust LLM (Real Weights, Real Prompts)  [STATUS: WORKING]
+  ────────────────────────────────────────────────────────────
+  Purpose:    End-to-end autoregressive generation benchmark using a real
+              quantized model, measuring the full inference pipeline.
+  What:       Loads a GGUF-quantized model via HuggingFace Candle and runs
+              greedy decoding (temperature=0) on a fixed set of 5 prompts
+              (short-creative, short-factual, medium-code, medium-reasoning,
+              long-summarise) defined in prompts.rs.
+  Models:     TinyLlama-1.1B Q4_K_M (default, ~700MB download)
+              Llama-3.2-1B-Instruct Q4_K_M (requires HF token)
+              Phi-4 and Qwen2.5-0.5B (registered but not yet supported)
+  Methodology: Same prompts, same max_new_tokens, greedy decoding. Model load
+               time measured separately and excluded from throughput numbers.
+  Metrics:    TTFT (Time To First Token / prefill latency),
+              output tokens/sec (decode throughput),
+              per-token latency p50/p95,
+              peak memory usage (RSS in MB).
+  Enabled:    `--features candle` (optionally `candle,metal` on macOS).
+
+  NOTE:       FireKing noted some weird TinyLlama prompt responses — possibly
+              related to the GGUF model source (ripped from unofficial repo
+              since official TinyLlama didn't have GGUF).
+
+  Collected data (Llama-3.2-1B Q4_K_M):
+    short-creative:   TTFT 104ms,  63.52 tok/s
+    short-factual:    TTFT 137ms,  60.00 tok/s
+    medium-code:      TTFT 280ms,  52.13 tok/s
+    medium-reasoning: TTFT 490ms,  53.47 tok/s
+    long-summarise:   TTFT 1846ms, 47.45 tok/s
+
+  Section 3: Training Benchmark with Burn TUI Dashboard  [STATUS: WORKING]
+  ─────────────────────────────────────────────────────
+  Purpose:    Measures training throughput (forward + backward + optimizer)
+              across Burn backends with autodiff enabled.
+  What:       Trains the same GPT model (and a GptTranspose variant) with
+              Adam optimizer on random token data, using Burn's built-in
+              SupervisedTraining framework and TUI dashboard (ratatui).
+  Backends:   Autodiff<NdArray> (CPU), Autodiff<WGPU> (GPU),
+              Autodiff<LibTorch> (optional).
+  GptTranspose: A variant model that uses weight tying via transpose —
+              logits = hidden * mix_weight^T + mix_weight, then matmul with
+              token_embedding^T. Exercises the transpose + addition pattern
+              that fuzzburn identified as crash-prone in Burn's autodiff.
+  Methodology: Same GptConfig, same batch size, random weights + random tokens.
+               3 epochs, 256 training items, 64 validation items.
+  Metrics:    Live loss curve, items/sec, epoch progress (TUI),
+              estimated kernel launches, bandwidth, avg step time.
+  Enabled:    `--features train`.
+
+  Python Comparison Benchmark  [STATUS: WORKING, on `merging` branch]
+  ────────────────────────────
+  Purpose:    Direct Python/PyTorch baseline for Section 1 comparison.
+  What:       Identical GPT architecture (same tiny/small configs) implemented
+              in PyTorch, run with same batch_size=4, seq_len=32, 50 iters.
+  Location:   python_benchmark/benchmark.py + python_benchmark/model.py
+  Device:     Auto-detects MPS (macOS) / CUDA / CPU.
+  Methodology: Same model config, same random input, 10 warmup + 50 measured
+               iterations with proper device sync (torch.mps.synchronize()).
+  Metrics:    Avg time/iter, p50 latency, throughput (tok/s).
+
+  Collected data (PyTorch MPS):
+    tiny:  avg 1246.86µs, 102,657.68 tok/s
+    small: avg 3121.67µs, 41,003.67 tok/s
+
+
+3. FILE STRUCTURE
+─────────────────
+  src/
+    main.rs           Orchestrator: runs all 3 sections, prints system info.
+                      On merging branch: CliConfig + parse_cli() for --model
+                      and --list-models flags. RuntimeConfig from CLI + env.
+    model.rs          GPT-style decoder-only transformer (Burn Module).
+                      GptConfig (tiny/small presets), Gpt<B>, GptTranspose<B>,
+                      TransformerBlock<B>, Mlp<B>.
+    benchmark.rs      BenchmarkStats (forward-pass metrics), GenerationStats
+                      (autoregressive metrics), BenchmarkConfig (batch/seq/iters),
+                      MemoryStats, compare_results(), compare_generation_results(),
+                      benchmark_model() function, memory measurement utilities.
+    candle_runner.rs  Candle GGUF model loader and greedy decode loop.
+                      CandleModelKind registry, CandleRunner with load()/generate().
+                      On merging branch: resolve_model(), print_available_models().
+    prompts.rs        Fixed prompt set (5 prompts) for reproducible benchmarks.
+                      BenchmarkPrompt struct, BENCHMARK_PROMPTS, WARMUP_PROMPT.
+    training.rs       Training benchmark using Burn's SupervisedTraining.
+                      RandomLMDataset, LMBatcher, TrainStep/InferenceStep impls
+                      for Gpt and GptTranspose, run_training_benchmark().
+  python_benchmark/   (on merging branch only)
+    benchmark.py      PyTorch benchmark runner — mirrors Section 1 methodology.
+    model.py          PyTorch GPT model — identical architecture to model.rs.
+  benches/
+    llm_benchmark.rs  Scaffold for criterion benchmarks (placeholder only).
+  Cargo.toml          Features: tch, candle, metal, cuda, train.
+                      Dependencies: burn 0.20.1, candle 0.8, hf-hub 0.3,
+                      tokenizers 0.21, sysinfo, criterion (dev).
+
+
+4. BRANCH STRUCTURE
+───────────────────
+  benchmarking       Original working branch (Sam's code). Currently checked out.
+  sam-benchmarking   Sam's feature branch (CLI --model flag, candle improvements).
+  merging            FireKing merged benchmarking + sam-benchmarking, added
+                     python benchmark, cleaned up code (stripped doc comments).
+  section-1          Based on merging. Attempt to fix section 1 + re-add comments.
+                     NOTE: Does NOT appear to actually fix the GPU sync issue.
+  master             Older code, burn 0.14, simpler (no GptTranspose, etc.).
+  transpose_crash    Older branch for GptTranspose crash reproduction.
+
+
+5. KEY DEPENDENCIES
+───────────────────
+  burn             0.20.1   Core tensor library (benchmarking+merging branches;
+                            same version as fuzzburn. master branch uses 0.14)
+  burn-ndarray     0.20.1   Pure Rust backend
+  burn-wgpu        0.20.1   GPU backend (WebGPU/Metal)
+  burn-tch         0.20.1   LibTorch backend (optional)
+  burn-train       0.20.1   Training framework with TUI (optional)
+  candle-core      0.8      HuggingFace Candle (pure Rust LLM inference)
+  candle-transformers 0.8   Pre-built model architectures (quantized_llama)
+  hf-hub           0.3      HuggingFace Hub API for model downloads
+  tokenizers       0.21     HuggingFace tokenizers
+  criterion        0.5      Benchmarking framework (dev-dependency, scaffold only)
+
+
+6. HOW THIS FITS INTO THE BROADER RESEARCH PROJECT
+───────────────────────────────────────────────────
+The broader project has three components:
+
+  a) fuzz_core / ad_trait fuzzer (cse291y/) — Differential fuzzer for the
+     ad_trait and evalexpr_jit autodiff libraries. Scalar-level AST
+     expressions. Found bugs in fract, acosh derivatives, sqrt branching.
+     This is the part already written up in the report (291p_report_latex.txt).
+
+  b) fuzzburn (fuzzburn/) — Differential fuzzer for the Burn tensor library.
+     2D tensor programs with SSA IR. Found 17 autograd crashes.
+     NOT YET in the report — needs to be added.
+
+  c) llm_benchmark (this repo) — Performance benchmarking of Burn and
+     Candle frameworks on real LLM workloads, compared against PyTorch.
+     NOT YET in the report — needs to be added.
+
+The connection between fuzzburn and llm_benchmark:
+
+  - SAME BURN VERSION: Both use burn 0.20.1.
+  - SAME BACKENDS: NdArray, WGPU, LibTorch tested in both.
+  - TRANSPOSE BUG REPRODUCTION: GptTranspose in training.rs exercises the
+    exact autodiff code path where fuzzburn found crashes.
+  - AUTODIFF STRESS: Section 3 runs full forward+backward+optimizer through
+    the same autodiff machinery fuzzburn found 17 crashes in.
+  - NARRATIVE: correctness (fuzzing) + performance (benchmarking) = complete
+    picture of the Rust ML ecosystem.
+
+
+7. CURRENT STATE OF THE REPORT (291p_report_latex.txt)
+──────────────────────────────────────────────────────
+The report currently covers ONLY the ad_trait/evalexpr_jit fuzzing work:
+  - Abstract, Intro, Background (AD, fuzzing, differential testing)
+  - Methodology (fuzz_core crate, AST generation, MainBackend trait,
+    fuzzing harness, oracles, error tolerances, fuzz targets)
+  - Evaluation (fract bug, acosh bug, sqrt branching, evalexpr_jit sqrt)
+  - Conclusion + Future Work
+
+NOT YET INCLUDED in the report:
+  - fuzzburn (tensor-level fuzzing, SSA IR, 17 autograd crashes)
+  - llm_benchmark (all three sections + Python comparison)
+  - Combined narrative tying all three together
+
+Data tables at the top of the report (DOCS TAB 1) contain:
+  - Llama-3.2-1B Candle generation results (Section 2 data — looks valid)
+  - Burn backend throughput (Section 1 data — INVALID, broken timing)
+  - PyTorch MPS benchmark (Python comparison — looks valid)
+  - Rust vs PyTorch comparison table (Section 1 + Python — INVALID for
+    Burn rows due to broken timing)
+
+
+8. ENVIRONMENT VARIABLES / CLI FLAGS
+─────────────────────────────────────
+  Env vars (original, on benchmarking branch):
+    LLM_BENCH_SECTION3_ONLY       Run only training section (skip 1 & 2)
+    LLM_BENCH_CANDLE_MODEL        Model selection: tinyllama|llama32|phi4|qwen|all
+    LLM_BENCH_HF_TOKEN / HF_TOKEN HuggingFace token for gated models
+    LLM_BENCH_KERNEL_LAUNCH_US    Per-kernel launch time estimate (default 5µs)
+    LLM_BENCH_TRAIN_TRANSPOSE_ONLY Run only transpose-tied model in section 3
+    CANDLE_GGUF_PATH              Override path to local GGUF file
+    CANDLE_TOKENIZER_PATH         Override path to local tokenizer.json
+
+  CLI flags (added on merging/section-1 branches):
+    --model <key>                 Pick model for Section 2 (e.g. tinyllama)
+    --list-models                 Print available models and exit
+    LLM_BENCH_MODEL env var       Fallback for --model
+
+
+9. WHAT IS IMPLEMENTED vs BROKEN vs PLACEHOLDER
+────────────────────────────────────────────────
+  Working:
+    - Section 2: Candle Llama-3.2-1B inference — data collected
+    - Section 3: Training with TUI dashboard (Gpt + GptTranspose)
+    - Python benchmark: PyTorch comparison — data collected
+    - Per-iteration/per-token latency percentiles
+    - Kernel launch overhead and bandwidth estimation (heuristic)
+    - Comparison tables with formatted output
+    - CLI --model/--list-models (on merging branch)
+
+  Fixed (commit 791f617 on merging branch):
+    - Section 1: Added B::sync(device) calls, sysinfo memory, version fix.
+
+  Broken (pre-existing, needs fix by another teammate):
+    - Section 2/3: candle_runner.rs has 13 compile errors — incomplete refactor
+      (missing constructor methods, missing local_dir_name field, argument
+      mismatch in build_hf_api, missing summarize_model_run function).
+
+  Placeholder / not yet working:
+    - Phi-4 and Qwen2.5-0.5B in Candle (registered but marked unsupported)
+    - benches/llm_benchmark.rs is a criterion scaffold (just `2 + 2`)
+
+  Not yet done:
+    - Branches not fully merged into one clean branch
+    - Code needs "de-GPT" cleanup (remove AI-generated bloat/comments)
+    - Report sections for fuzzburn and llm_benchmark not written
+    - Need to collect all benchmark data from a single machine for consistency
+================================================================================
