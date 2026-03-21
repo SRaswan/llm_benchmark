@@ -1,5 +1,7 @@
 #[cfg(feature = "candle")]
 pub mod inner {
+    use std::fs;
+    use std::io::{Read, Write};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -455,7 +457,14 @@ pub mod inner {
             let repo = api.repo(Repo::new((*repo_id).to_string(), RepoType::Model));
             match repo.get("tokenizer.json") {
                 Ok(path) => return Ok(path),
-                Err(e) => errors.push(format!("{repo_id}: {e}")),
+                Err(e) => {
+                    errors.push(format!("{repo_id}: {e}"));
+
+                    if let Ok(path) = download_tokenizer_direct(repo_id) {
+                        println!("  [Candle] Downloaded tokenizer.json via direct HTTP fallback from {repo_id}");
+                        return Ok(path);
+                    }
+                }
             }
         }
 
@@ -463,6 +472,51 @@ pub mod inner {
             "could not fetch tokenizer.json from candidate repos [{}]",
             errors.join(" | ")
         ))
+    }
+
+    fn download_tokenizer_direct(repo_id: &str) -> Result<PathBuf, String> {
+        let url = format!(
+            "https://huggingface.co/{repo}/resolve/main/tokenizer.json",
+            repo = repo_id
+        );
+
+        let mut req = ureq::get(&url);
+        if let Ok(token) = std::env::var("HF_TOKEN")
+            .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
+        {
+            req = req.set("Authorization", &format!("Bearer {token}"));
+        }
+
+        let resp = req
+            .call()
+            .map_err(|e| format!("{repo_id}: direct GET failed: {e}"))?;
+
+        if resp.status() != 200 {
+            return Err(format!(
+                "{repo_id}: direct GET returned status {}",
+                resp.status()
+            ));
+        }
+
+        let mut body = Vec::new();
+        resp.into_reader()
+            .read_to_end(&mut body)
+            .map_err(|e| format!("{repo_id}: read body failed: {e}"))?;
+
+        let mut cache_dir = std::env::temp_dir();
+        cache_dir.push("llm_benchmark");
+        cache_dir.push("tokenizers");
+        cache_dir.push(repo_id.replace('/', "__"));
+        fs::create_dir_all(&cache_dir)
+            .map_err(|e| format!("{repo_id}: create cache dir failed: {e}"))?;
+
+        let path = cache_dir.join("tokenizer.json");
+        let mut file = fs::File::create(&path)
+            .map_err(|e| format!("{repo_id}: create tokenizer cache file failed: {e}"))?;
+        file.write_all(&body)
+            .map_err(|e| format!("{repo_id}: write tokenizer cache file failed: {e}"))?;
+
+        Ok(path)
     }
 
     fn build_hf_api() -> Result<Api, String> {

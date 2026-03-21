@@ -4206,6 +4206,7 @@ dependencies = [
  "sysinfo 0.30.13",
  "tokenizers",
  "tokio",
+ "ureq",
 ]
 
 [[package]]
