@@ -15,44 +15,6 @@ pub mod inner {
     use crate::benchmark::{GenerationStats, MemoryStats};
     use crate::prompts::BenchmarkPrompt;
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum CandleModelKind {
-        TinyLlama,
-        Llama32_1B,
-        Phi4,
-        Qwen25_05B,
-    }
-
-    impl CandleModelKind {
-        pub fn parse(s: &str) -> Option<Self> {
-            match s.to_lowercase().as_str() {
-                "tinyllama" | "tiny_llama" => Some(Self::TinyLlama),
-                "llama32" | "llama3.2" | "llama3.2-1b" | "llama-3.2-1b" => Some(Self::Llama32_1B),
-                "phi4" | "phi-4" => Some(Self::Phi4),
-                "qwen" | "qwen2.5" | "qwen2.5-0.5b" | "qwen2_5_0_5b" => Some(Self::Qwen25_05B),
-                _ => None,
-            }
-        }
-
-        pub fn all() -> Vec<Self> {
-            vec![
-                Self::TinyLlama,
-                Self::Llama32_1B,
-                Self::Phi4,
-                Self::Qwen25_05B,
-            ]
-        }
-
-        pub fn config(&self) -> CandleModelConfig {
-            match self {
-                Self::TinyLlama => CandleModelConfig::tiny_llama(),
-                Self::Llama32_1B => CandleModelConfig::llama32_1b(),
-                Self::Phi4 => CandleModelConfig::phi4(),
-                Self::Qwen25_05B => CandleModelConfig::qwen25_05b(),
-            }
-        }
-    }
-
     #[derive(Debug, Clone)]
     pub struct CandleModelConfig {
         pub hf_repo: &'static str,
@@ -403,7 +365,7 @@ pub mod inner {
             return Ok((gguf_path, tokenizer_path));
         }
 
-        if let Some((gguf_path, tokenizer_path)) = try_local_model_folder(config)? {
+        if let Some((gguf_path, tokenizer_path)) = try_local_tinyllama_folder(config)? {
             return Ok((gguf_path, tokenizer_path));
         }
 
@@ -431,20 +393,17 @@ pub mod inner {
         Ok((gguf_path, tokenizer_path))
     }
 
-    fn try_local_model_folder(
+    fn try_local_tinyllama_folder(
         config: &CandleModelConfig,
     ) -> Result<Option<(PathBuf, PathBuf)>, String> {
-        let folder = PathBuf::from(config.local_dir_name);
+        let folder = PathBuf::from("tinyllama");
         if !folder.is_dir() {
             return Ok(None);
         }
 
         let tokenizer_path = folder.join("tokenizer.json");
         if !tokenizer_path.is_file() {
-            return Err(format!(
-                "Local folder '{}' found but tokenizer.json is missing",
-                config.local_dir_name
-            ));
+            return Err("Local folder 'tinyllama' found but tokenizer.json is missing".to_string());
         }
 
         let preferred = folder.join(config.gguf_file);
@@ -453,10 +412,9 @@ pub mod inner {
         } else {
             let mut ggufs = Vec::new();
             for entry in std::fs::read_dir(&folder)
-                .map_err(|e| format!("Cannot read local folder '{}': {e}", config.local_dir_name))?
+                .map_err(|e| format!("Cannot read tinyllama folder: {e}"))?
             {
-                let entry = entry
-                    .map_err(|e| format!("Cannot read local folder '{}': {e}", config.local_dir_name))?;
+                let entry = entry.map_err(|e| format!("Cannot read tinyllama folder: {e}"))?;
                 let path = entry.path();
                 if path
                     .extension()
@@ -468,40 +426,33 @@ pub mod inner {
                 }
             }
 
-            match ggufs.len() {
-                0 => {
-                    return Err(format!(
-                        "Local folder '{}' found but no .gguf file is present",
-                        config.local_dir_name
-                    ))
-                }
-                1 => ggufs.remove(0),
-                _ => {
-                    return Err(format!(
-                        "Multiple .gguf files found in '{}'; set CANDLE_GGUF_PATH to pick one",
-                        config.local_dir_name
-                    ))
-                }
+            if ggufs.len() == 1 {
+                ggufs.remove(0)
+            } else if ggufs.is_empty() {
+                return Err("Local folder 'tinyllama' found but no .gguf file is present".to_string());
+            } else {
+                return Err(
+                    "Multiple .gguf files found in 'tinyllama'; set CANDLE_GGUF_PATH to pick one"
+                        .to_string(),
+                );
             }
         };
 
-        println!("  [Candle] Using local folder: {}", config.local_dir_name);
+        println!("  [Candle] Using local folder: tinyllama");
         Ok(Some((gguf_path, tokenizer_path)))
     }
 
-    fn build_hf_api(explicit_token: Option<&str>) -> Result<Api, String> {
-        let token = explicit_token
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("LLM_BENCH_HF_TOKEN").ok())
-            .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
+    fn build_hf_api() -> Result<Api, String> {
+        let token = std::env::var("HUGGING_FACE_HUB_TOKEN")
+            .ok()
             .or_else(|| std::env::var("HF_TOKEN").ok());
-
         let api = if let Some(token) = token {
-            ApiBuilder::new().with_token(Some(token)).build()
+            ApiBuilder::new()
+                .with_token(Some(token))
+                .build()
         } else {
             Api::new()
         };
-
         api.map_err(|e| format!("HF Hub API error: {e}"))
     }
 }
