@@ -1,5 +1,7 @@
 #[cfg(feature = "candle")]
 pub mod inner {
+    use std::fs;
+    use std::io::{Read, Write};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -14,44 +16,6 @@ pub mod inner {
 
     use crate::benchmark::{GenerationStats, MemoryStats};
     use crate::prompts::BenchmarkPrompt;
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum CandleModelKind {
-        TinyLlama,
-        Llama32_1B,
-        Phi4,
-        Qwen25_05B,
-    }
-
-    impl CandleModelKind {
-        pub fn parse(s: &str) -> Option<Self> {
-            match s.to_lowercase().as_str() {
-                "tinyllama" | "tiny_llama" => Some(Self::TinyLlama),
-                "llama32" | "llama3.2" | "llama3.2-1b" | "llama-3.2-1b" => Some(Self::Llama32_1B),
-                "phi4" | "phi-4" => Some(Self::Phi4),
-                "qwen" | "qwen2.5" | "qwen2.5-0.5b" | "qwen2_5_0_5b" => Some(Self::Qwen25_05B),
-                _ => None,
-            }
-        }
-
-        pub fn all() -> Vec<Self> {
-            vec![
-                Self::TinyLlama,
-                Self::Llama32_1B,
-                Self::Phi4,
-                Self::Qwen25_05B,
-            ]
-        }
-
-        pub fn config(&self) -> CandleModelConfig {
-            match self {
-                Self::TinyLlama => CandleModelConfig::tiny_llama(),
-                Self::Llama32_1B => CandleModelConfig::llama32_1b(),
-                Self::Phi4 => CandleModelConfig::phi4(),
-                Self::Qwen25_05B => CandleModelConfig::qwen25_05b(),
-            }
-        }
-    }
 
     #[derive(Debug, Clone)]
     pub struct CandleModelConfig {
@@ -131,9 +95,15 @@ pub mod inner {
     
     pub fn resolve_model(key: &str) -> Option<CandleModelConfig> {
         let key_lower = key.to_lowercase();
+        let normalized = match key_lower.as_str() {
+            "tiny_llama" => "tinyllama",
+            "llama32" | "llama3.2" | "llama3.2-1b" | "llama-3.2-1b" => "llama3-1b",
+            "llama3.2-3b" | "llama-3.2-3b" => "llama3-3b",
+            _ => key_lower.as_str(),
+        };
         model_registry()
             .into_iter()
-            .find(|entry| entry.key == key_lower)
+            .find(|entry| entry.key == normalized)
             .map(|entry| entry.config)
     }
 
@@ -161,6 +131,7 @@ pub mod inner {
         println!("    cargo run --release --features candle -- --model tinyllama");
         println!("    cargo run --release --features candle -- --model phi3");
         println!("    HF_TOKEN=hf_xxx cargo run --release --features candle -- --model llama3-1b");
+        println!("    LLM_BENCH_CANDLE_MODEL=llama32 cargo run --release --features candle");
         println!("    cargo run --release --features candle -- --list-models");
         println!();
     }
@@ -211,7 +182,6 @@ pub mod inner {
                     Device::Cpu => "CPU".to_string(),
                     Device::Metal(_) => "Metal (Apple GPU)".to_string(),
                     Device::Cuda(_) => "CUDA".to_string(),
-                    _ => "Other".to_string(),
                 }
             );
 
@@ -403,7 +373,7 @@ pub mod inner {
             return Ok((gguf_path, tokenizer_path));
         }
 
-        if let Some((gguf_path, tokenizer_path)) = try_local_model_folder(config)? {
+        if let Some((gguf_path, tokenizer_path)) = try_local_tinyllama_folder(config)? {
             return Ok((gguf_path, tokenizer_path));
         }
 
@@ -414,15 +384,15 @@ pub mod inner {
             .map_err(|e| format!("Model download error: {e}"))?;
 
         println!("  [Candle] Fetching tokenizer ...");
-        let tok_repo = api.repo(Repo::new(
-            config.tokenizer_repo.to_string(),
-            RepoType::Model,
-        ));
-        let tokenizer_path = tok_repo.get("tokenizer.json").map_err(|e| {
+        let tokenizer_path = fetch_tokenizer_json(
+            api,
+            &[config.tokenizer_repo, config.hf_repo],
+        )
+        .map_err(|e| {
             let mut msg = format!("Tokenizer download error: {e}");
             if msg.contains("RelativeUrlWithoutBase") {
                 msg.push_str(
-                    " (this often means the repo is gated; set HF_TOKEN / HUGGING_FACE_HUB_TOKEN)",
+                    " (this can happen with auth/repo resolution issues; verify HF_TOKEN / HUGGING_FACE_HUB_TOKEN and accepted model terms)",
                 );
             }
             msg
@@ -431,20 +401,17 @@ pub mod inner {
         Ok((gguf_path, tokenizer_path))
     }
 
-    fn try_local_model_folder(
+    fn try_local_tinyllama_folder(
         config: &CandleModelConfig,
     ) -> Result<Option<(PathBuf, PathBuf)>, String> {
-        let folder = PathBuf::from(config.local_dir_name);
+        let folder = PathBuf::from("tinyllama");
         if !folder.is_dir() {
             return Ok(None);
         }
 
         let tokenizer_path = folder.join("tokenizer.json");
         if !tokenizer_path.is_file() {
-            return Err(format!(
-                "Local folder '{}' found but tokenizer.json is missing",
-                config.local_dir_name
-            ));
+            return Err("Local folder 'tinyllama' found but tokenizer.json is missing".to_string());
         }
 
         let preferred = folder.join(config.gguf_file);
@@ -453,10 +420,9 @@ pub mod inner {
         } else {
             let mut ggufs = Vec::new();
             for entry in std::fs::read_dir(&folder)
-                .map_err(|e| format!("Cannot read local folder '{}': {e}", config.local_dir_name))?
+                .map_err(|e| format!("Cannot read tinyllama folder: {e}"))?
             {
-                let entry = entry
-                    .map_err(|e| format!("Cannot read local folder '{}': {e}", config.local_dir_name))?;
+                let entry = entry.map_err(|e| format!("Cannot read tinyllama folder: {e}"))?;
                 let path = entry.path();
                 if path
                     .extension()
@@ -468,40 +434,102 @@ pub mod inner {
                 }
             }
 
-            match ggufs.len() {
-                0 => {
-                    return Err(format!(
-                        "Local folder '{}' found but no .gguf file is present",
-                        config.local_dir_name
-                    ))
-                }
-                1 => ggufs.remove(0),
-                _ => {
-                    return Err(format!(
-                        "Multiple .gguf files found in '{}'; set CANDLE_GGUF_PATH to pick one",
-                        config.local_dir_name
-                    ))
-                }
+            if ggufs.len() == 1 {
+                ggufs.remove(0)
+            } else if ggufs.is_empty() {
+                return Err("Local folder 'tinyllama' found but no .gguf file is present".to_string());
+            } else {
+                return Err(
+                    "Multiple .gguf files found in 'tinyllama'; set CANDLE_GGUF_PATH to pick one"
+                        .to_string(),
+                );
             }
         };
 
-        println!("  [Candle] Using local folder: {}", config.local_dir_name);
+        println!("  [Candle] Using local folder: tinyllama");
         Ok(Some((gguf_path, tokenizer_path)))
     }
 
-    fn build_hf_api(explicit_token: Option<&str>) -> Result<Api, String> {
-        let token = explicit_token
-            .map(|s| s.to_string())
-            .or_else(|| std::env::var("LLM_BENCH_HF_TOKEN").ok())
-            .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
-            .or_else(|| std::env::var("HF_TOKEN").ok());
+    fn fetch_tokenizer_json(api: &Api, repo_ids: &[&str]) -> Result<PathBuf, String> {
+        let mut errors = Vec::new();
 
+        for repo_id in repo_ids {
+            let repo = api.repo(Repo::new((*repo_id).to_string(), RepoType::Model));
+            match repo.get("tokenizer.json") {
+                Ok(path) => return Ok(path),
+                Err(e) => {
+                    errors.push(format!("{repo_id}: {e}"));
+
+                    if let Ok(path) = download_tokenizer_direct(repo_id) {
+                        println!("  [Candle] Downloaded tokenizer.json via direct HTTP fallback from {repo_id}");
+                        return Ok(path);
+                    }
+                }
+            }
+        }
+
+        Err(format!(
+            "could not fetch tokenizer.json from candidate repos [{}]",
+            errors.join(" | ")
+        ))
+    }
+
+    fn download_tokenizer_direct(repo_id: &str) -> Result<PathBuf, String> {
+        let url = format!(
+            "https://huggingface.co/{repo}/resolve/main/tokenizer.json",
+            repo = repo_id
+        );
+
+        let mut req = ureq::get(&url);
+        if let Ok(token) = std::env::var("HF_TOKEN")
+            .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
+        {
+            req = req.set("Authorization", &format!("Bearer {token}"));
+        }
+
+        let resp = req
+            .call()
+            .map_err(|e| format!("{repo_id}: direct GET failed: {e}"))?;
+
+        if resp.status() != 200 {
+            return Err(format!(
+                "{repo_id}: direct GET returned status {}",
+                resp.status()
+            ));
+        }
+
+        let mut body = Vec::new();
+        resp.into_reader()
+            .read_to_end(&mut body)
+            .map_err(|e| format!("{repo_id}: read body failed: {e}"))?;
+
+        let mut cache_dir = std::env::temp_dir();
+        cache_dir.push("llm_benchmark");
+        cache_dir.push("tokenizers");
+        cache_dir.push(repo_id.replace('/', "__"));
+        fs::create_dir_all(&cache_dir)
+            .map_err(|e| format!("{repo_id}: create cache dir failed: {e}"))?;
+
+        let path = cache_dir.join("tokenizer.json");
+        let mut file = fs::File::create(&path)
+            .map_err(|e| format!("{repo_id}: create tokenizer cache file failed: {e}"))?;
+        file.write_all(&body)
+            .map_err(|e| format!("{repo_id}: write tokenizer cache file failed: {e}"))?;
+
+        Ok(path)
+    }
+
+    fn build_hf_api() -> Result<Api, String> {
+        let token = std::env::var("HUGGING_FACE_HUB_TOKEN")
+            .ok()
+            .or_else(|| std::env::var("HF_TOKEN").ok());
         let api = if let Some(token) = token {
-            ApiBuilder::new().with_token(Some(token)).build()
+            ApiBuilder::new()
+                .with_token(Some(token))
+                .build()
         } else {
             Api::new()
         };
-
         api.map_err(|e| format!("HF Hub API error: {e}"))
     }
 }
