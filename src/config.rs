@@ -64,7 +64,9 @@ pub fn parse_cli() -> CliConfig {
     }
 
     if config.model_key.is_none() {
-        config.model_key = std::env::var("LLM_BENCH_MODEL").ok();
+        config.model_key = std::env::var("LLM_BENCH_CANDLE_MODEL")
+            .ok()
+            .or_else(|| std::env::var("LLM_BENCH_MODEL").ok());
     }
 
     config

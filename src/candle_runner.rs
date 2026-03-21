@@ -93,9 +93,15 @@ pub mod inner {
     
     pub fn resolve_model(key: &str) -> Option<CandleModelConfig> {
         let key_lower = key.to_lowercase();
+        let normalized = match key_lower.as_str() {
+            "tiny_llama" => "tinyllama",
+            "llama32" | "llama3.2" | "llama3.2-1b" | "llama-3.2-1b" => "llama3-1b",
+            "llama3.2-3b" | "llama-3.2-3b" => "llama3-3b",
+            _ => key_lower.as_str(),
+        };
         model_registry()
             .into_iter()
-            .find(|entry| entry.key == key_lower)
+            .find(|entry| entry.key == normalized)
             .map(|entry| entry.config)
     }
 
@@ -123,6 +129,7 @@ pub mod inner {
         println!("    cargo run --release --features candle -- --model tinyllama");
         println!("    cargo run --release --features candle -- --model phi3");
         println!("    HF_TOKEN=hf_xxx cargo run --release --features candle -- --model llama3-1b");
+        println!("    LLM_BENCH_CANDLE_MODEL=llama32 cargo run --release --features candle");
         println!("    cargo run --release --features candle -- --list-models");
         println!();
     }
@@ -173,7 +180,6 @@ pub mod inner {
                     Device::Cpu => "CPU".to_string(),
                     Device::Metal(_) => "Metal (Apple GPU)".to_string(),
                     Device::Cuda(_) => "CUDA".to_string(),
-                    _ => "Other".to_string(),
                 }
             );
 
@@ -376,15 +382,15 @@ pub mod inner {
             .map_err(|e| format!("Model download error: {e}"))?;
 
         println!("  [Candle] Fetching tokenizer ...");
-        let tok_repo = api.repo(Repo::new(
-            config.tokenizer_repo.to_string(),
-            RepoType::Model,
-        ));
-        let tokenizer_path = tok_repo.get("tokenizer.json").map_err(|e| {
+        let tokenizer_path = fetch_tokenizer_json(
+            api,
+            &[config.tokenizer_repo, config.hf_repo],
+        )
+        .map_err(|e| {
             let mut msg = format!("Tokenizer download error: {e}");
             if msg.contains("RelativeUrlWithoutBase") {
                 msg.push_str(
-                    " (this often means the repo is gated; set HF_TOKEN / HUGGING_FACE_HUB_TOKEN)",
+                    " (this can happen with auth/repo resolution issues; verify HF_TOKEN / HUGGING_FACE_HUB_TOKEN and accepted model terms)",
                 );
             }
             msg
@@ -440,6 +446,23 @@ pub mod inner {
 
         println!("  [Candle] Using local folder: tinyllama");
         Ok(Some((gguf_path, tokenizer_path)))
+    }
+
+    fn fetch_tokenizer_json(api: &Api, repo_ids: &[&str]) -> Result<PathBuf, String> {
+        let mut errors = Vec::new();
+
+        for repo_id in repo_ids {
+            let repo = api.repo(Repo::new((*repo_id).to_string(), RepoType::Model));
+            match repo.get("tokenizer.json") {
+                Ok(path) => return Ok(path),
+                Err(e) => errors.push(format!("{repo_id}: {e}")),
+            }
+        }
+
+        Err(format!(
+            "could not fetch tokenizer.json from candidate repos [{}]",
+            errors.join(" | ")
+        ))
     }
 
     fn build_hf_api() -> Result<Api, String> {
