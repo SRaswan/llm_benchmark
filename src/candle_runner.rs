@@ -450,6 +450,8 @@ pub mod inner {
         Ok(Some((gguf_path, tokenizer_path)))
     }
 
+        // direct lamma if token not working, idk how to get token to work all the time
+
     fn fetch_tokenizer_json(api: &Api, repo_ids: &[&str]) -> Result<PathBuf, String> {
         let mut errors = Vec::new();
 
